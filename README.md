@@ -28,7 +28,8 @@ A compact reading reminder that lives in your sidebar. Shows just the books with
 ### Library
 Tabs for your Planned, Completed, and Archived books. Completed books go on a virtual bookshelf when you finish them. Archived books remember why they were set aside and can be restored.
 
-![Library](images/planned-reading-view.jpg)
+![Library](images/planned-reading-view.jpg) 
+![Library](images/completed-view.jpg) 
 
 ### Honest scheduling
 Verso builds schedules from contiguous page ranges. When you log your actual pages read, it redistributes remaining pages correctly — no phantom debt from pages you've already read. Backdated start dates, missed days, and catch-up sessions all resolve cleanly.
@@ -77,7 +78,8 @@ It's built for independent readers and book clubs — people who read for their 
 4. Set your start date, target finish date, and reading days
 5. Verso builds your schedule — start reading
 
-
+![Add a Book](images/add-a-book-view.jpg)
+![Book](images/book-view.jpg)
 
 
 ---
