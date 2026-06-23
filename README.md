@@ -2,7 +2,7 @@
 
 **Your reading life, scheduled.**
 
-Verso is a reading tracker for Obsidian that helps you build realistic reading schedules and stay on pace — without the guilt trips. It tells you where you actually are, not where you wish you were.
+Verso is a reading scheduler for Obsidian that helps you build realistic reading schedules and stay on pace — without the guilt trips. It tells you where you actually are, not where you wish you were.
 
 ---
 
