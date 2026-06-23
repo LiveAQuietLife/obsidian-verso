@@ -23,7 +23,7 @@ Your active reading, at a glance. Books are sorted by urgency: at-risk first, th
 
 
 ### Today sidebar
-A compact reading reminder that lives in your sidebar. Shows just the books with something due today — tap to mark a chunk complete without leaving your notes.
+A compact reading reminder that lives in your sidebar. Shows just the books with something due today — click to mark a chunk complete without leaving your notes.
 
 ### Library
 Tabs for your Planned, Completed, and Archived books. Completed books go on a virtual bookshelf when you finish them. Archived books remember why they were set aside and can be restored.
