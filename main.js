@@ -1,6 +1,6 @@
 /*
  * Verso — Your reading life, scheduled.
- * v0.2.0 — Data Model
+ * v1.0.1 — Data Model
  */
 
 const { Plugin, PluginSettingTab, Setting, Notice, Modal, ItemView } = require('obsidian');
@@ -645,71 +645,6 @@ class VersoPlugin extends Plugin {
 
     this.addSettingTab(new VersoSettingTab(this.app, this));
 
-    // ── TEMPORARY TEST COMMANDS (removed once dashboard UI exists) ──
-
-    this.addCommand({
-      id: 'verso-test-show-today',
-      name: "Verso (test): Show today's chunks",
-      callback: () => {
-        const todays = this.getTodaysChunks();
-        console.log("=== Verso test: today's chunks ===", todays);
-        if (todays.length === 0) {
-          new Notice('No reading scheduled for today. Check console for details.');
-        } else {
-          const summary = todays.map(c => `${c.label} (${c.status})`).join(', ');
-          new Notice(`Today: ${summary}`);
-        }
-      }
-    });
-
-    this.addCommand({
-      id: 'verso-test-complete-first-chunk',
-      name: "Verso (test): Mark first upcoming chunk complete",
-      callback: async () => {
-        const upcoming = this.settings.chunks
-          .filter(c => c.status === 'upcoming')
-          .sort((a, b) => new Date(a.scheduledDate) - new Date(b.scheduledDate));
-
-        if (upcoming.length === 0) {
-          new Notice('No upcoming chunks to complete.');
-          return;
-        }
-
-        const chunk = upcoming[0];
-        await this.markChunkComplete(chunk.id);
-        console.log('=== Verso test: marked complete ===', chunk);
-        new Notice(`Marked "${chunk.label}" complete.`);
-      }
-    });
-
-    this.addCommand({
-      id: 'verso-test-simulate-missed-day',
-      name: "Verso (test): Simulate a missed day (back-date first chunk)",
-      callback: async () => {
-        const upcoming = this.settings.chunks
-          .filter(c => c.status === 'upcoming')
-          .sort((a, b) => new Date(a.scheduledDate) - new Date(b.scheduledDate));
-
-        if (upcoming.length === 0) {
-          new Notice('No upcoming chunks to back-date.');
-          return;
-        }
-
-        // Back-date the first upcoming chunk to yesterday so the next
-        // recalculation marks it missed and redistributes its pages
-        const yesterday = new Date();
-        yesterday.setDate(yesterday.getDate() - 1);
-        upcoming[0].scheduledDate = versoLocalDateString(yesterday);
-        await this.saveSettings();
-
-        await this.recalculateBook(upcoming[0].bookId);
-
-        const chunks = this.getChunksForBook(upcoming[0].bookId);
-        console.log('=== Verso test: after simulated missed day ===', chunks);
-        new Notice('Back-dated first chunk and recalculated. Check console.');
-      }
-    });
-
     this.addCommand({
       id: 'verso-add-book',
       name: 'Add a book',
@@ -718,23 +653,6 @@ class VersoPlugin extends Plugin {
       }
     });
 
-    this.addCommand({
-      id: 'verso-test-clear-all-data',
-      name: 'Verso (test): Clear all data (reset)',
-      callback: async () => {
-        this.settings.collections = [];
-        this.settings.books = [];
-        this.settings.chunks = [];
-        this.settings.sessions = [];
-        await this.saveSettings();
-        new Notice('All Verso data cleared.');
-      }
-    });
-
-    console.log(`Verso v${this.manifest.version} loaded.`);
-    console.log('Collections:', this.settings.collections.length);
-    console.log('Books:', this.settings.books.length);
-    console.log('Chunks:', this.settings.chunks.length);
   }
 
   onunload() {
@@ -2875,6 +2793,10 @@ class VersoEditScheduleModal extends Modal {
     this.startDate = book.startDate || versoToday();
     this.targetFinishDate = book.targetFinishDate || '';
 
+    this.selectedCollectionId = book.collectionId || null;
+    this.isCreatingNewCollection = false;
+    this.newCollectionName = '';
+
     // A book may have no override yet (readingDaysOverride === null, meaning
     // it currently follows the global default). Pre-fill the day grid with
     // the global default in that case, same fallback AddBookModal uses, so
@@ -2985,6 +2907,76 @@ class VersoEditScheduleModal extends Modal {
       this.updateConfirmButtonState();
     });
 
+    // ── Collection picker ────────────────────────────────────────
+    // Shelf reassignment is metadata-only — changing a book's collection
+    // does not affect its schedule in any way. A "— No shelf —" option is
+    // always present so a book can stay (or be moved) outside any collection
+    // without silently force-assigning it when the modal opens.
+    const collectionTerm = this.getCollectionTerm();
+    const singularTerm = this.singularize(collectionTerm);
+    const collections = this.plugin.settings.collections;
+
+    const collField = form.createDiv({ cls: 'verso-field' });
+    collField.createEl('label', {
+      text: this.capitalize(singularTerm),
+      cls: 'verso-field-label'
+    });
+
+    const collSelect = collField.createEl('select', { cls: 'verso-input' });
+
+    const noneOpt = collSelect.createEl('option', {
+      text: `\u2014 No ${singularTerm} \u2014`,
+      value: '__none__'
+    });
+
+    collections.forEach(c => {
+      const opt = collSelect.createEl('option', { text: c.name, value: c.id });
+      if (this.book.collectionId === c.id) opt.selected = true;
+    });
+
+    collSelect.createEl('option', {
+      text: `+ New ${singularTerm}`,
+      value: '__new__'
+    });
+
+    if (!this.book.collectionId) {
+      noneOpt.selected = true;
+    }
+
+    const newCollField = form.createDiv({ cls: 'verso-field verso-field-indent' });
+    newCollField.createEl('label', {
+      text: `New ${singularTerm} name`,
+      cls: 'verso-field-label'
+    });
+    const newCollInput = newCollField.createEl('input', {
+      type: 'text',
+      cls: 'verso-input',
+      attr: { placeholder: `e.g. ${this.exampleCollectionName(collectionTerm)}` }
+    });
+    newCollInput.value = this.newCollectionName;
+    newCollInput.addEventListener('input', e => {
+      this.newCollectionName = e.target.value;
+      this.updateConfirmButtonState();
+    });
+
+    const updateCollectionSelection = () => {
+      const val = collSelect.value;
+      if (val === '__new__') {
+        this.isCreatingNewCollection = true;
+        this.selectedCollectionId = null;
+        newCollField.style.display = 'flex';
+        newCollInput.focus();
+      } else {
+        this.isCreatingNewCollection = false;
+        this.selectedCollectionId = val === '__none__' ? null : val;
+        newCollField.style.display = 'none';
+      }
+      this.updateConfirmButtonState();
+    };
+
+    collSelect.addEventListener('change', updateCollectionSelection);
+    newCollField.style.display = 'none';
+
     // ── Buttons ──────────────────────────────────────────────────
     const buttons = contentEl.createDiv({ cls: 'verso-confirm-buttons' });
 
@@ -3023,6 +3015,41 @@ class VersoEditScheduleModal extends Modal {
     const readingDaysOverride = this.overrideReadingDays
       ? { ...this.customReadingDays }
       : null;
+
+    // ── Collection reassignment ──────────────────────────────────
+    // Purely a metadata update — no schedule recalculation needed.
+    // Manage both sides of the collection.books arrays so the data
+    // stays consistent with addBook's own bookkeeping.
+    let newCollectionId = this.selectedCollectionId;
+
+    if (this.isCreatingNewCollection && this.newCollectionName.trim()) {
+      const newColl = await this.plugin.addCollection({
+        name: this.newCollectionName.trim()
+      });
+      newCollectionId = newColl.id;
+    }
+
+    const oldCollectionId = this.book.collectionId;
+    if (oldCollectionId !== newCollectionId) {
+      if (oldCollectionId) {
+        const oldColl = this.plugin.getCollection(oldCollectionId);
+        if (oldColl) {
+          await this.plugin.updateCollection(oldCollectionId, {
+            books: oldColl.books.filter(id => id !== this.book.id)
+          });
+        }
+      }
+      if (newCollectionId) {
+        const newColl = this.plugin.getCollection(newCollectionId);
+        if (newColl) {
+          await this.plugin.updateCollection(newCollectionId, {
+            books: [...newColl.books, this.book.id]
+          });
+        }
+      }
+      await this.plugin.updateBook(this.book.id, { collectionId: newCollectionId });
+    }
+
     await this.plugin.updateBookDates(this.book.id, this.startDate, this.targetFinishDate, readingDaysOverride);
     new Notice(`Schedule updated for "${this.book.title}".`);
     if (this.onUpdated) this.onUpdated();
@@ -3037,6 +3064,9 @@ class VersoEditScheduleModal extends Modal {
   // the relative ordering of the dates, then the "not in the past" guard —
   // a finish date can't be earlier than the start date OR earlier than today.
   validationError() {
+    if (this.isCreatingNewCollection && !this.newCollectionName.trim()) {
+      return `Enter a name for the new ${this.singularize(this.getCollectionTerm())}.`;
+    }
     if (!this.startDate || !this.targetFinishDate) return null;
     if (this.targetFinishDate < this.startDate) {
       return 'Finish date must be on or after the start date.';
@@ -3060,6 +3090,41 @@ class VersoEditScheduleModal extends Modal {
 
   onClose() {
     this.contentEl.empty();
+  }
+
+  getCollectionTerm() {
+    const term = this.plugin.settings.collectionTerm;
+    if (term === 'custom') {
+      return this.plugin.settings.collectionTermCustom || 'collection';
+    }
+    return term;
+  }
+
+  capitalize(str) {
+    if (!str) return str;
+    return str.charAt(0).toUpperCase() + str.slice(1);
+  }
+
+  singularize(term) {
+    const map = {
+      classes: 'class',
+      projects: 'project',
+      subjects: 'subject',
+      lists: 'list',
+      shelves: 'shelf'
+    };
+    return map[term] || term;
+  }
+
+  exampleCollectionName(term) {
+    const examples = {
+      classes: 'OT Survey',
+      projects: 'Summer reading',
+      subjects: 'Bible',
+      lists: 'To read',
+      shelves: 'Currently reading'
+    };
+    return examples[term] || 'New collection';
   }
 }
 
@@ -3418,6 +3483,8 @@ class AddBookModal extends Modal {
         break;
     }
   }
+
+  // ── Step content (placeholders for now) ──────────────────────
 
   renderFindStep(body) {
     body.createDiv({ cls: 'verso-section-label', text: 'BOOK DETAILS' });
