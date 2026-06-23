@@ -19,17 +19,24 @@ If you fall behind, it doesn't spiral into shame math — it redistributes your 
 ### Dashboard
 Your active reading, at a glance. Books are sorted by urgency: at-risk first, then behind, then on-track by due date, then not yet started. Each book shows its status, today's reading chunk, and progress toward completion.
 
+![Dashboard](images/dashboard-view.jpg)
+
+
 ### Today sidebar
 A compact reading reminder that lives in your sidebar. Shows just the books with something due today — tap to mark a chunk complete without leaving your notes.
 
 ### Library
 Tabs for your Planned, Completed, and Archived books. Completed books go on a virtual bookshelf when you finish them. Archived books remember why they were set aside and can be restored.
 
+![Library](images/planned-reading-view.jpg)
+
 ### Honest scheduling
 Verso builds schedules from contiguous page ranges. When you log your actual pages read, it redistributes remaining pages correctly — no phantom debt from pages you've already read. Backdated start dates, missed days, and catch-up sessions all resolve cleanly.
 
 ### Book completion celebration
 When you finish a book, Verso shows when you originally planned to finish versus when you actually did. No inflated praise — just the truth, warmly delivered.
+
+![Finished Book](images/book-finished-view.jpg)
 
 ### Customizable vocabulary
 Call your reading collections whatever fits: Projects, Lists, Shelves, or your own word. It propagates throughout the interface.
@@ -69,6 +76,9 @@ It's built for independent readers and book clubs — people who read for their 
 3. Enter the title, author, and page count
 4. Set your start date, target finish date, and reading days
 5. Verso builds your schedule — start reading
+
+
+
 
 ---
 
