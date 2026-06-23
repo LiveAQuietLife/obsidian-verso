@@ -1,0 +1,1162 @@
+/* 
+ * Verso — Your reading life, scheduled.
+ * v0.1.0 — Scaffold styles
+ */
+
+/* ─── Settings page ─────────────────────────────────────────── */
+
+.verso-settings-tagline {
+  color: var(--text-muted);
+  font-style: italic;
+  margin-top: -8px;
+  margin-bottom: 16px;
+}
+
+.verso-settings-desc {
+  color: var(--text-muted);
+  font-size: 0.85em;
+  margin-top: -8px;
+  margin-bottom: 12px;
+}
+
+/* ─── Add a Book modal — shell ─────────────────────────────── */
+
+.verso-add-book-modal {
+  width: 100%;
+  max-width: 720px;
+}
+
+.verso-modal-header {
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  margin-bottom: 16px;
+}
+
+.verso-modal-title {
+  margin: 0 0 16px 0;
+}
+
+.verso-step-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.verso-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.verso-step-dot {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  font-size: 0.8em;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.verso-step-label {
+  font-size: 0.9em;
+  white-space: nowrap;
+}
+
+.verso-step-connector {
+  flex: 1;
+  height: 1px;
+  background-color: var(--background-modifier-border);
+  min-width: 16px;
+}
+
+/* Step states */
+
+.verso-step-upcoming .verso-step-dot {
+  background-color: var(--background-modifier-border);
+  color: var(--text-muted);
+}
+
+.verso-step-upcoming .verso-step-label {
+  color: var(--text-muted);
+}
+
+.verso-step-current .verso-step-dot {
+  background-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.verso-step-current .verso-step-label {
+  color: var(--text-normal);
+  font-weight: 600;
+}
+
+.verso-step-done .verso-step-dot {
+  background-color: var(--text-success);
+  color: var(--text-on-accent);
+}
+
+.verso-step-done .verso-step-label {
+  color: var(--text-muted);
+}
+
+/* Body */
+
+.verso-modal-body {
+  min-height: 280px;
+}
+
+.verso-step-placeholder {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* Footer */
+
+.verso-modal-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 16px;
+  border-top: 1px solid var(--background-modifier-border);
+  margin-top: 16px;
+}
+
+.verso-footer-left,
+.verso-footer-right {
+  display: flex;
+  gap: 8px;
+}
+
+.verso-btn {
+  padding: 6px 16px;
+  border-radius: var(--radius-s);
+  font-size: 0.9em;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+.verso-btn-text {
+  background: transparent;
+  color: var(--text-muted);
+  border-color: transparent;
+}
+
+.verso-btn-text:hover {
+  color: var(--text-normal);
+  background-color: var(--background-modifier-hover);
+}
+
+.verso-btn-secondary {
+  background-color: var(--background-secondary);
+  color: var(--text-normal);
+  border-color: var(--background-modifier-border);
+}
+
+.verso-btn-secondary:hover {
+  background-color: var(--background-modifier-hover);
+}
+
+.verso-btn-primary {
+  background-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.verso-btn-primary:hover {
+  background-color: var(--interactive-accent-hover);
+}
+
+.verso-btn-danger {
+  background: transparent;
+  color: var(--color-red);
+  border-color: var(--background-modifier-border);
+}
+
+.verso-btn-danger:hover {
+  background-color: var(--color-red);
+  color: white;
+  border-color: var(--color-red);
+}
+
+.verso-btn-disabled,
+.verso-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.verso-btn-disabled:hover,
+.verso-btn:disabled:hover {
+  background-color: var(--interactive-accent);
+}
+
+.verso-footer-hint {
+  display: flex;
+  align-items: center;
+  font-size: 0.8em;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* ─── Add a Book modal — step 1 form ───────────────────────── */
+
+.verso-section-label {
+  font-size: 0.75em;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin-bottom: 12px;
+}
+
+.verso-form {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  max-width: 420px;
+}
+
+.verso-form-section-label {
+  font-size: 0.75em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin: 0;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.verso-field-inline {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.verso-input-color {
+  width: 36px;
+  height: 28px;
+  padding: 2px;
+  border-radius: var(--radius-s);
+  border: 1px solid var(--background-modifier-border);
+  background-color: var(--background-primary);
+  cursor: pointer;
+}
+
+.verso-field-warning {
+  color: var(--text-warning, var(--text-muted));
+  font-style: italic;
+}
+
+.verso-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.verso-field-desc {
+  color: var(--text-muted);
+  font-size: 0.85em;
+  margin-top: 2px;
+}
+
+.verso-field-error {
+  color: var(--text-error);
+  font-size: 0.85em;
+  margin-top: 4px;
+  min-height: 1.2em;
+}
+
+.verso-field-label {
+  font-size: 0.85em;
+  font-weight: 600;
+  color: var(--text-normal);
+}
+
+.verso-input {
+  padding: 6px 10px;
+  border-radius: var(--radius-s);
+  border: 1px solid var(--background-modifier-border);
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 0.95em;
+  height: auto;
+}
+
+.verso-input:focus {
+  outline: none;
+  border-color: var(--interactive-accent);
+}
+
+.verso-color-swatch-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.verso-color-swatch {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  cursor: pointer;
+  box-sizing: border-box;
+  border: 2px solid transparent;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.verso-color-swatch:hover {
+  border-color: var(--background-modifier-border);
+}
+
+.verso-color-swatch-selected {
+  border-color: var(--text-normal);
+}
+
+.verso-color-swatch-selected::after {
+  content: '✓';
+  color: var(--background-primary);
+  font-size: 13px;
+  font-weight: 700;
+  text-shadow: 0 0 2px rgba(0, 0, 0, 0.6);
+}
+
+/* ─── Add a Book modal — step 2 form ───────────────────────── */
+
+.verso-field-indent {
+  padding-left: 16px;
+  border-left: 2px solid var(--background-modifier-border);
+}
+
+.verso-field-toggle {
+  flex-direction: row;
+  align-items: center;
+}
+
+.verso-toggle-label,
+.verso-day-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: 0.9em;
+}
+
+.verso-checkbox {
+  cursor: pointer;
+}
+
+.verso-days-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin-top: 4px;
+}
+
+/* ─── Add a Book modal — step 3 confirm ────────────────────── */
+
+.verso-section-label-spaced {
+  margin-top: 20px;
+}
+
+.verso-confirm-book-card {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  padding: 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background-color: var(--background-secondary);
+}
+
+.verso-confirm-cover {
+  width: 48px;
+  height: 64px;
+  border-radius: var(--radius-s);
+  flex-shrink: 0;
+  border: 1px solid var(--background-modifier-border);
+}
+
+.verso-confirm-book-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.verso-confirm-title {
+  font-weight: 600;
+  font-size: 1.05em;
+}
+
+.verso-confirm-author {
+  color: var(--text-muted);
+}
+
+.verso-confirm-meta {
+  color: var(--text-muted);
+  font-size: 0.85em;
+}
+
+.verso-summary-table {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  overflow: hidden;
+}
+
+.verso-summary-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.verso-summary-row:last-child {
+  border-bottom: none;
+}
+
+.verso-summary-label {
+  color: var(--text-muted);
+  font-size: 0.9em;
+}
+
+.verso-summary-value {
+  font-weight: 500;
+  font-size: 0.9em;
+}
+
+.verso-pace-note {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius-m);
+  background-color: color-mix(in srgb, var(--color-green) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-green) 28%, transparent);
+  color: var(--text-normal);
+  font-size: 0.9em;
+}
+
+.verso-pace-note-warning {
+  background-color: color-mix(in srgb, var(--color-red) 12%, transparent);
+  border-color: color-mix(in srgb, var(--color-red) 28%, transparent);
+}
+
+.verso-chunk-preview-card {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+
+.verso-chunk-preview-header {
+  font-size: 0.8em;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.verso-chunk-preview-label {
+  font-size: 0.95em;
+}
+
+.verso-preview-middle-note {
+  color: var(--text-muted);
+  font-size: 0.85em;
+  font-style: italic;
+  text-align: center;
+  padding: 4px 0;
+}
+
+/* ─── Dashboard view ────────────────────────────────────────── */
+
+.verso-dashboard-view {
+  padding: 20px;
+}
+
+.verso-dashboard-title {
+  margin-top: 0;
+}
+
+.verso-dashboard-empty {
+  max-width: 560px;
+  margin: 48px auto;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+
+.verso-empty-icon-circle {
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  background-color: var(--background-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.8em;
+}
+
+.verso-empty-title {
+  margin: 0;
+}
+
+.verso-empty-description {
+  color: var(--text-muted);
+  margin: 0;
+  line-height: 1.5;
+}
+
+.verso-empty-buttons {
+  display: flex;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+/* ─── Dashboard view — stat cards ──────────────────────────── */
+
+.verso-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.verso-stat-card {
+  background-color: var(--background-secondary);
+  border-radius: var(--radius-m);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.verso-stat-label {
+  color: var(--text-muted);
+  font-size: 0.85em;
+}
+
+.verso-stat-value {
+  font-size: 1.6em;
+  font-weight: 600;
+}
+
+.verso-stat-subtext {
+  color: var(--text-muted);
+  font-size: 0.8em;
+}
+
+@media (max-width: 700px) {
+  .verso-stat-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+/* ─── Dashboard view — today's reading ─────────────────────── */
+
+.verso-section-heading {
+  margin: 24px 0 12px 0;
+}
+
+.verso-today-row-complete {
+  cursor: pointer;
+  opacity: 0.6;
+}
+
+.verso-today-row-complete:hover {
+  opacity: 1;
+  background-color: var(--background-modifier-hover);
+}
+
+.verso-today-checkbox {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 2px solid var(--background-modifier-border);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.85em;
+}
+
+.verso-today-checkbox-checked {
+  background-color: var(--text-success);
+  border-color: var(--text-success);
+  color: var(--text-on-accent);
+}
+
+.verso-today-info {
+  flex: 1;
+}
+
+.verso-today-label {
+  font-weight: 500;
+}
+
+.verso-today-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.verso-today-pages {
+  color: var(--text-muted);
+  font-size: 0.9em;
+}
+
+.verso-badge {
+  font-size: 0.75em;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+
+.verso-badge-behind {
+  background-color: color-mix(in srgb, var(--color-red) 15%, transparent);
+  color: var(--color-red);
+}
+
+.verso-badge-on-track {
+  background-color: color-mix(in srgb, var(--color-green) 15%, transparent);
+  color: var(--color-green);
+}
+
+.verso-badge-behind-soft {
+  background-color: color-mix(in srgb, var(--color-orange) 16%, transparent);
+  color: var(--color-orange);
+}
+
+.verso-badge-planned {
+  background-color: var(--background-modifier-border);
+  color: var(--text-muted);
+}
+
+.verso-badge-complete {
+  background-color: color-mix(in srgb, var(--interactive-accent) 15%, transparent);
+  color: var(--interactive-accent);
+}
+
+/* Same neutral register as .verso-badge-planned (nothing's wrong, it just
+   hasn't begun yet) — distinguished from it by label text only ("Starts
+   {date}" vs "Planned"), not by color, since both are "not active" states. */
+.verso-badge-not-started {
+  background-color: var(--background-modifier-border);
+  color: var(--text-muted);
+}
+
+/* ─── Dashboard view — book progress ───────────────────────── */
+
+.verso-progress-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.verso-progress-card {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  padding: 14px 16px;
+}
+
+/* A "today's reading" chunk row inside a merged dashboard card. Acts as
+   the card's header when present — no border/background of its own,
+   since the card already provides those. */
+.verso-dashboard-card-chunk-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.verso-dashboard-card-chunk-row + .verso-dashboard-card-chunk-row {
+  margin-top: -2px;
+}
+
+.verso-dashboard-card-chunk-row .verso-today-checkbox {
+  cursor: pointer;
+  transition: border-color 0.1s ease, background-color 0.1s ease;
+}
+
+.verso-dashboard-card-chunk-row .verso-today-checkbox:hover {
+  border-color: var(--interactive-accent);
+}
+
+.verso-dashboard-card-chunk-row .verso-today-checkbox-checked:hover {
+  background-color: var(--text-success);
+  border-color: var(--text-success);
+  opacity: 0.8;
+}
+
+.verso-dashboard-card-chunk-row .verso-today-label {
+  font-weight: 600;
+  font-size: 1.05em;
+}
+
+.verso-progress-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 10px;
+}
+
+.verso-progress-title {
+  font-weight: 600;
+  font-size: 1.05em;
+}
+
+.verso-progress-author {
+  color: var(--text-muted);
+  font-size: 0.85em;
+  font-style: italic;
+  margin-top: 2px;
+}
+
+.verso-progress-meta {
+  color: var(--text-muted);
+  font-size: 0.85em;
+  margin-top: 2px;
+}
+
+.verso-progress-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.verso-progress-bar-track {
+  flex: 1;
+  height: 8px;
+  border-radius: 999px;
+  background-color: var(--background-modifier-border);
+  overflow: hidden;
+}
+
+.verso-progress-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+}
+
+.verso-bar-on-track {
+  background-color: var(--text-success);
+}
+
+.verso-bar-behind {
+  background-color: var(--text-warning);
+}
+
+.verso-bar-at-risk {
+  background-color: var(--text-error);
+}
+
+.verso-bar-planned {
+  background-color: var(--background-modifier-border);
+}
+
+.verso-bar-complete {
+  background-color: var(--interactive-accent);
+}
+
+.verso-progress-percent {
+  font-size: 0.85em;
+  color: var(--text-muted);
+  min-width: 36px;
+  text-align: right;
+}
+
+.verso-progress-catchup {
+  margin-top: 8px;
+  font-size: 0.85em;
+  color: var(--text-muted);
+}
+
+/* ─── Clickable progress card ──────────────────────────────── */
+
+.verso-progress-card-clickable {
+  cursor: pointer;
+}
+
+.verso-progress-card-clickable:hover {
+  background-color: var(--background-modifier-hover);
+}
+
+/* ─── Book View ────────────────────────────────────────────── */
+
+.verso-book-view {
+  padding: 20px;
+}
+
+.verso-book-back {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.verso-book-back-link {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--background-modifier-border);
+  background-color: var(--background-secondary);
+  color: var(--text-muted);
+  font-size: 0.85em;
+  cursor: pointer;
+  text-decoration: none;
+  transition: background-color 0.1s ease, color 0.1s ease, border-color 0.1s ease;
+}
+
+.verso-book-back-link:hover {
+  color: var(--text-normal);
+  background-color: var(--background-modifier-hover);
+  border-color: var(--interactive-accent);
+}
+
+.verso-book-header {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.verso-book-cover {
+  width: 56px;
+  height: 76px;
+  border-radius: var(--radius-s);
+  flex-shrink: 0;
+  border: 1px solid var(--background-modifier-border);
+}
+
+.verso-book-info {
+  flex: 1;
+}
+
+.verso-book-title {
+  margin: 0 0 2px 0;
+}
+
+.verso-book-subtitle {
+  color: var(--text-muted);
+  margin-bottom: 12px;
+}
+
+.verso-book-status-row {
+  margin-bottom: 8px;
+}
+
+.verso-book-bar {
+  margin-bottom: 6px;
+}
+
+.verso-book-progress-text {
+  font-size: 0.9em;
+  color: var(--text-muted);
+}
+
+.verso-book-actions {
+  margin-top: 24px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* ─── Library view ──────────────────────────────────────────── */
+
+.verso-library-view {
+  padding: 20px;
+}
+
+.verso-dashboard-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 4px;
+}
+
+.verso-dashboard-header-row .verso-dashboard-title {
+  margin: 0;
+}
+
+.verso-dashboard-header-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+/* ─── Library view — tabs ───────────────────────────────────── */
+
+/* The "shelf": a horizontal band the tab pills sit on, with a subtle
+   bottom edge to read as a surface rather than a plain underline. */
+.verso-library-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 8px 8px 12px 8px;
+  margin: 16px 0 20px 0;
+  background-color: var(--background-secondary);
+  border-radius: var(--radius-m);
+  border-bottom: 3px solid var(--background-modifier-border);
+}
+
+.verso-library-tab {
+  padding: 6px 16px;
+  font-size: 0.9em;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: var(--radius-s) var(--radius-s) 2px 2px;
+  background-color: transparent;
+  transition: background-color 0.1s ease, color 0.1s ease;
+}
+
+.verso-library-tab:hover {
+  color: var(--text-normal);
+  background-color: var(--background-modifier-hover);
+}
+
+.verso-library-tab-active {
+  color: var(--text-on-accent);
+  font-weight: 600;
+  background-color: var(--interactive-accent);
+}
+
+.verso-library-tab-active:hover {
+  background-color: var(--interactive-accent-hover);
+  color: var(--text-on-accent);
+}
+
+/* ─── Library view — book lists ─────────────────────────────── */
+
+.verso-library-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.verso-library-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+}
+
+.verso-library-row-clickable {
+  cursor: pointer;
+}
+
+.verso-library-row-clickable:hover {
+  background-color: var(--background-modifier-hover);
+}
+
+.verso-library-cover {
+  width: 32px;
+  height: 44px;
+  border-radius: var(--radius-s);
+  flex-shrink: 0;
+  border: 1px solid var(--background-modifier-border);
+}
+
+.verso-library-info {
+  flex: 1;
+}
+
+.verso-library-title {
+  font-weight: 500;
+}
+
+.verso-library-author {
+  color: var(--text-muted);
+  font-size: 0.85em;
+  font-style: italic;
+  margin-top: 2px;
+}
+
+.verso-library-meta {
+  color: var(--text-muted);
+  font-size: 0.85em;
+  margin-top: 2px;
+}
+
+.verso-library-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* ─── Confirm Modal ────────────────────────────────────────── */
+
+.verso-confirm-body {
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.verso-confirm-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+/* ─── Today Sidebar view ────────────────────────────────────── */
+
+.verso-today-sidebar-view {
+  padding: 14px 12px;
+}
+
+.verso-today-sidebar-empty {
+  color: var(--text-muted);
+  font-size: 0.85em;
+  padding: 12px 4px;
+}
+
+.verso-today-sidebar-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.verso-today-sidebar-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+}
+
+.verso-today-sidebar-row-complete {
+  opacity: 0.55;
+}
+
+.verso-today-sidebar-row-preview {
+  opacity: 0.8;
+}
+
+.verso-today-sidebar-row-preview.verso-today-sidebar-row-complete {
+  opacity: 0.5;
+}
+
+.verso-today-sidebar-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.verso-today-sidebar-title {
+  font-size: 0.85em;
+  font-weight: 600;
+  overflow-wrap: break-word;
+}
+
+.verso-today-sidebar-row-complete .verso-today-sidebar-title {
+  text-decoration: line-through;
+}
+
+.verso-today-sidebar-label {
+  font-size: 0.8em;
+  color: var(--text-muted);
+}
+
+.verso-today-sidebar-row .verso-today-checkbox {
+  width: 18px;
+  height: 18px;
+  margin-top: 1px;
+}
+
+/* ─── Book Complete modal ──────────────────────────────────── */
+
+.verso-complete-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  margin-bottom: 18px;
+}
+
+.verso-complete-cover {
+  width: 48px;
+  height: 64px;
+  border-radius: var(--radius-s);
+  flex-shrink: 0;
+}
+
+.verso-complete-title {
+  font-size: 1.05em;
+  font-weight: 600;
+  margin-top: 4px;
+  line-height: 1.3;
+}
+
+.verso-complete-meta {
+  font-size: 0.85em;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+.verso-complete-headline {
+  font-size: 1.3em;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.verso-complete-subtext {
+  font-size: 0.9em;
+  color: var(--text-muted);
+  line-height: 1.5;
+  margin-bottom: 16px;
+}
+
+.verso-complete-note {
+  font-size: 0.85em;
+  line-height: 1.5;
+  padding: 10px 14px;
+  border-radius: 0 var(--radius-s) var(--radius-s) 0;
+  margin-bottom: 18px;
+}
+
+.verso-complete-note-rescheduled {
+  background-color: var(--background-modifier-border);
+  border-left: 2px solid var(--text-muted);
+  color: var(--text-muted);
+}
+
+.verso-complete-note-early {
+  background-color: color-mix(in srgb, var(--color-green) 12%, transparent);
+  border-left: 2px solid var(--color-green);
+  color: var(--text-normal);
+}
+
+.verso-complete-shelf-label {
+  font-size: 0.75em;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+
+.verso-complete-shelf {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  padding: 12px 12px 14px;
+  background-color: var(--background-secondary);
+  border-radius: var(--radius-m);
+  min-height: 56px;
+  flex-wrap: wrap;
+}
+
+.verso-complete-spine {
+  width: 16px;
+  height: 48px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.verso-complete-spine-newest {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 1px;
+}
+
+.verso-complete-shelf-count {
+  font-size: 0.8em;
+  color: var(--text-muted);
+  margin-top: 8px;
+}
