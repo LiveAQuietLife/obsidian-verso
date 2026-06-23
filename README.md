@@ -26,13 +26,13 @@ Your active reading, at a glance. Books are sorted by urgency: at-risk first, th
 A compact reading reminder that lives in your sidebar. Shows just the books with something due today — click to mark a chunk complete without leaving your notes.
 
 ### Library
-Tabs for your Planned, Completed, and Archived books. Completed books go on a virtual bookshelf when you finish them. Archived books remember why they were set aside and can be restored.
+Tabs for your Planned, Completed, and Archived books. Finished books get shelved — literally: their spines line up on a visual bookshelf, sorted by when you finished them. Archived books remember why they were set aside and can be restored whenever you're ready to pick them back up
 
 ![Library](images/planned-reading-view.jpg) 
 ![Library](images/completed-view.jpg) 
 
 ### Honest scheduling
-Verso builds schedules from contiguous page ranges. When you log your actual pages read, it redistributes remaining pages correctly — no phantom debt from pages you've already read. Backdated start dates, missed days, and catch-up sessions all resolve cleanly.
+When you log what you actually read — more or less than the plan — Verso updates your schedule around reality, not the original numbers. Catch up or fall behind, the math always starts from where you actually are. Backdated start dates, missed days, and catch-up sessions all resolve cleanly.
 
 ### Book completion celebration
 When you finish a book, Verso shows when you originally planned to finish versus when you actually did. No inflated praise — just the truth, warmly delivered.
@@ -40,7 +40,7 @@ When you finish a book, Verso shows when you originally planned to finish versus
 ![Finished Book](images/book-finished-view.jpg)
 
 ### Customizable vocabulary
-Call your reading collections whatever fits: Projects, Lists, Shelves, or your own word. It propagates throughout the interface.
+Reading for a book club? Tracking a project? Working through a subject? Call your collections whatever fits your situation — Projects, Lists, Shelves, Classes, or your own word. The label propagates throughout the interface so it always feels like yours.
 
 ### Flexible reading days
 Set your default reading days globally (every day, weekdays only, or custom), then override per book as needed.
@@ -93,4 +93,4 @@ It's built for independent readers and book clubs — people who read for their 
 
 ## License
 
-MIT
+[MIT](LICENSE)
