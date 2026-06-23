@@ -93,4 +93,4 @@ It's built for independent readers and book clubs — people who read for their 
 
 ## License
 
-[MIT](LICENSE)
+[MIT](https://github.com/LiveAQuietLife/obsidian-verso/blob/main/LICENSE)
