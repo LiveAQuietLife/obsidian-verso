@@ -1,10 +1,10 @@
 {
   "id": "verso",
   "name": "Verso",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "minAppVersion": "1.13.0",
-  "description": "Your reading life, scheduled. Track books, build reading schedules, and stay on pace.",
+  "description": "Your reading life, scheduled. Track books, build reading schedules, and stay on pace — all inside Obsidian.",
   "author": "LiveAQuietLife",
-  "authorUrl": "https://github.com/LiveAQuietLife",
-  "isDesktopOnly": false
+  "authorUrl": "http://github.com/LiveAQuietLife",
+  "isDesktopOnly": true
 }
