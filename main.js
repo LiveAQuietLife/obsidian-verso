@@ -1,6 +1,6 @@
 /*
  * Verso — Your reading life, scheduled.
- * v1.0.1 — Data Model
+ * v1.0.3 — Data Model
  */
 
 const { Plugin, PluginSettingTab, Setting, Notice, Modal, ItemView } = require('obsidian');
