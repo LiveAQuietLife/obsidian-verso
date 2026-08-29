@@ -17,9 +17,9 @@ If you fall behind, it doesn't spiral into shame math — it redistributes your 
 ## Features
 
 ### Dashboard
-Your active reading, at a glance. Books are sorted by urgency: at-risk first, then behind, then on-track by due date, then not yet started. Each book shows its status, today's reading chunk, and progress toward completion.
+Your active reading, at a glance. Books are sorted by urgency: off-pace first, then at-risk, then behind, then on-track by due date, then not yet started. Each book shows its status, today's reading chunk, and progress toward completion.
 
-![Dashboard](images/dashboard-view.jpg)
+![Dashboard](images/dashboard-new.jpg)
 
 
 ### Today sidebar
@@ -28,11 +28,13 @@ A compact reading reminder that lives in your sidebar. Shows just the books with
 ### Library
 Tabs for your Planned, Completed, and Archived books. Finished books get shelved — literally: their spines line up on a visual bookshelf, sorted by when you finished them. Archived books remember why they were set aside and can be restored whenever you're ready to pick them back up
 
-![Library](images/planned-reading-view.jpg) 
-![Library](images/completed-view.jpg) 
+![Library](images/library-new.jpg) 
+![Library](images/library-completed-new.jpg) 
 
 ### Honest scheduling
 When you log what you actually read — more or less than the plan — Verso updates your schedule around reality, not the original numbers. Catch up or fall behind, the math always starts from where you actually are. Backdated start dates, missed days, and catch-up sessions all resolve cleanly.
+
+If a book's target date passes entirely, Verso doesn't keep inventing a new plan around a date that's already gone. It marks the book **Off pace**, stops scheduling, and waits — your progress stays exactly as it was, with nothing new to check off until you set a new target date. Once you do, it picks up from where you actually are, not from page one.
 
 ### Book completion celebration
 When you finish a book, Verso shows when you originally planned to finish versus when you actually did. No inflated praise — just the truth, warmly delivered.
@@ -86,7 +88,7 @@ It's built for independent readers and book clubs — people who read for their 
 
 ## Compatibility
 
-- Obsidian 1.13.0 or later
+- Obsidian 1.13.1 or later
 - Desktop only
 
 ---
