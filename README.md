@@ -26,7 +26,7 @@ Your active reading, at a glance. Books are sorted by urgency: off-pace first, t
 A compact reading reminder that lives in your sidebar. Shows just the books with something due today — click to mark a chunk complete without leaving your notes.
 
 ### Library
-Tabs for your Planned, Completed, and Archived books. Finished books get shelved — literally: their spines line up on a visual bookshelf, sorted by when you finished them. Archived books remember why they were set aside and can be restored whenever you're ready to pick them back up
+Tabs for your Planned, Completed, and Archived books. Finished books get shelved — literally: their spines line up on a visual bookshelf, sorted by when you finished them. Archived books remember why they were set aside and can be restored whenever you're ready to pick them back up.
 
 ![Library](images/library-new.jpg) 
 ![Library](images/library-completed-new.jpg) 
@@ -37,9 +37,12 @@ When you log what you actually read — more or less than the plan — Verso upd
 If a book's target date passes entirely, Verso doesn't keep inventing a new plan around a date that's already gone. It marks the book **Off pace**, stops scheduling, and waits — your progress stays exactly as it was, with nothing new to check off until you set a new target date. Once you do, it picks up from where you actually are, not from page one.
 
 ### Book completion celebration
-When you finish a book, Verso shows when you originally planned to finish versus when you actually did. No inflated praise — just the truth, warmly delivered.
+When you finish a book, Verso marks the moment with a quote about reading — a different one each time, drawn from a larger set for longer books. It also tells you honestly whether you moved your finish date along the way, and lines your finished book up on a shelf with everything else you've read this year. No inflated praise — just the truth, warmly delivered.
 
-![Finished Book](images/book-finished-view.jpg)
+![Finished Book](images/new-finished-book.png)
+
+### Pages or percent
+Reading on a Kindle, Kobo, or another e-reader that only shows percentages? Track that book by percent instead of page numbers. Set it per book when you add or edit it — the scheduling math works exactly the same either way.
 
 ### Customizable vocabulary
 Reading for a book club? Tracking a project? Working through a subject? Call your collections whatever fits your situation — Projects, Lists, Shelves, Classes, or your own word. The label propagates throughout the interface so it always feels like yours.
@@ -80,16 +83,22 @@ It's built for independent readers and book clubs — people who read for their 
 4. Set your start date, target finish date, and reading days
 5. Verso builds your schedule — start reading
 
-![Add a Book](images/add-a-book-view.jpg)
-![Book](images/book-view.jpg)
-
+![Add a Book](images/new-add-a-book.png)
 
 ---
 
 ## Compatibility
 
 - Obsidian 1.13.1 or later
-- Desktop only
+- Desktop and mobile
+
+Mobile support is new as of 1.3.0 and has been tested on Android. One rough
+edge worth knowing about: when you tap into a field in one of the shorter
+windows — logging progress, or setting dates when starting a book — the
+on-screen keyboard may cover it. The field still works; you just can't see it
+while typing. This is a longstanding Obsidian Mobile behavior that affects
+many plugins, and it's [been raised with
+Obsidian](https://forum.obsidian.md/t/mobile-shrink-modal-height-on-typing-to-accomodate-the-keyboard/117408).
 
 ---
 
