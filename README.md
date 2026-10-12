@@ -92,13 +92,9 @@ It's built for independent readers and book clubs — people who read for their 
 - Obsidian 1.13.1 or later
 - Desktop and mobile
 
-Mobile support is new as of 1.3.0 and has been tested on Android. One rough
-edge worth knowing about: when you tap into a field in one of the shorter
-windows — logging progress, or setting dates when starting a book — the
-on-screen keyboard may cover it. The field still works; you just can't see it
-while typing. This is a longstanding Obsidian Mobile behavior that affects
-many plugins, and it's [been raised with
-Obsidian](https://forum.obsidian.md/t/mobile-shrink-modal-height-on-typing-to-accomodate-the-keyboard/117408).
+Mobile support is new as of 1.3.0 and has been tested on Android. As of
+1.3.2, when the on-screen keyboard would cover the field you're typing in,
+Verso's shorter windows move up just far enough to keep it visible.
 
 ---
 

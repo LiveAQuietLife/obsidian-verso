@@ -1,6 +1,8 @@
 /*
  * Verso — Your reading life, scheduled.
- * v1.0.3 — Data Model
+ * v1.3.2 — Percent-mode "Mark read" message, restore asks for a new
+ * finish date, archived-book and view-refresh fixes, sync reload, mobile
+ * keyboard, keyboard access, and CSS fixes
  */
 
 const { Plugin, PluginSettingTab, Setting, Notice, Modal, ItemView } = require('obsidian');
@@ -89,9 +91,13 @@ const DEFAULT_SETTINGS = {
   onboardingComplete: false,
 
   // ── Vocabulary ──────────────────────────────────────────────
-  // Options: 'classes', 'projects', 'subjects', 'lists', 'shelves', 'custom'
+  // Options: 'projects', 'lists', 'shelves', 'custom'
+  // For 'custom', collectionTermCustom holds the SINGULAR form and
+  // collectionTermCustomPlural the plural. The singular keeps its original
+  // key so existing vaults upgrade without a migration step.
   collectionTerm: 'lists',
   collectionTermCustom: '',
+  collectionTermCustomPlural: '',
 
   // ── Reading days ────────────────────────────────────────────
   // Options: 'everyday', 'weekdays', 'custom'
@@ -110,7 +116,11 @@ const DEFAULT_SETTINGS = {
   collections: [],
   books: [],
   chunks: [],
-  sessions: []
+  sessions: [],
+
+  // Texts of completion quotes already shown in the current cycle, so a
+  // quote doesn't repeat until its pool has been used up. (v1.3.2)
+  quotesShown: []
 };
 
 // ─── Data Helpers ────────────────────────────────────────────────────────────
@@ -175,6 +185,12 @@ function createBook(data = {}) {
     statusBeforeArchive: data.statusBeforeArchive || null,
     archiveReason: data.archiveReason || '',
     archiveReasonCategory: data.archiveReasonCategory || null,
+    // 'page' (default) or 'percent' — 'percent' is for e-readers (Kindle,
+    // Kobo, etc.) that only expose a percent-complete figure, not a page
+    // number. Internally everything still stores/computes in pages; this
+    // only changes what the reader types in and what the daily target
+    // label shows. (LiveAQuietLife, 2026-09-04)
+    progressInputMode: data.progressInputMode || 'page',
     dateAdded: new Date().toISOString()
   };
 }
@@ -214,22 +230,10 @@ function createSession(data = {}) {
 // A center-screen alternative to Obsidian's top-right Notice, for Verso's own
 // messages. Auto-fades and removes itself; not meant for stacking (one at a
 // time is the expected use).
+// Appearance lives in styles.css under .verso-toast so themes and snippets
+// can override it; only the fade-out, which is behaviour, stays here.
 function versoToast(message, timeout = 4000) {
   const el = document.body.createDiv({ cls: 'verso-toast', text: message });
-  el.style.position = 'fixed';
-  el.style.top = '40%';
-  el.style.left = '50%';
-  el.style.transform = 'translate(-50%, -50%)';
-  el.style.zIndex = '99999';
-  el.style.background = 'var(--interactive-accent)';
-  el.style.border = 'none';
-  el.style.color = 'var(--text-on-accent)';
-  el.style.padding = '12px 18px';
-  el.style.borderRadius = '8px';
-  el.style.boxShadow = '0 4px 16px rgba(0, 0, 0, 0.3)';
-  el.style.maxWidth = '320px';
-  el.style.textAlign = 'center';
-  el.style.transition = 'opacity 0.3s ease';
   window.setTimeout(() => {
     el.style.opacity = '0';
     window.setTimeout(() => el.remove(), 300);
@@ -252,7 +256,7 @@ function isDayEnabled(dayNumber, readingDays) {
 // Convert the global readingDays setting ('everyday' | 'weekdays' | 'custom')
 // into the { sun, mon, tue, wed, thu, fri, sat } object shape used by
 // per-book overrides. Shared by AddBookModal (initial default) and
-// VersoEditScheduleModal (fallback when a book has no override yet).
+// VersoEditBookModal (fallback when a book has no override yet).
 function globalReadingDaysAsObject(settings) {
   const setting = settings.readingDays;
 
@@ -286,6 +290,20 @@ function calculatePaceNeeded(totalPages, pagesRead, finishDate, readingDays) {
   return Math.ceil(remainingPages / readingDaysLeft);
 }
 
+// A book is "off pace" once its target finish date no longer has any reading
+// day left before it — there is no sane way left to distribute the remaining
+// pages across a schedule. Rather than collapsing everything onto today
+// (the old behavior — see recalculateSchedule's freeze branch and Verso
+// future-works §1.1–§1.4), the book's schedule simply stops generating new
+// chunks until the reader sets a new target date. Single source of truth for
+// this condition — getBookStatus, recalculateSchedule, and getBookProgress
+// all defer to it so the three can never drift out of sync with each other.
+function isOffPace(book, readingDays) {
+  if (!book.targetFinishDate) return false;
+  const today = versoToday();
+  return countReadingDays(today, book.targetFinishDate, readingDays) <= 0;
+}
+
 // Single source of truth for "is this chunk missed?" — a chunk already marked
 // 'missed' by recalculation, OR an 'upcoming' chunk whose scheduled date has
 // passed but hasn't been recalculated yet. Used by status, progress, and the
@@ -293,6 +311,20 @@ function calculatePaceNeeded(totalPages, pagesRead, finishDate, readingDays) {
 function isChunkMissed(chunk, today) {
   return chunk.status === 'missed' ||
     (chunk.status === 'upcoming' && chunk.scheduledDate < today);
+}
+
+// A missed chunk only counts toward current status/progress math if it
+// belongs to the book's CURRENT reading attempt — i.e., it's dated on or
+// after the most recent reactivation, if the book has ever gone off-pace
+// and come back. Chunks from a lapsed attempt before the reader set a new
+// target date remain in the data permanently (untouched, for a possible
+// future insights feature — see Verso future-works) but stop being
+// load-bearing for any LIVE number the moment a fresh attempt begins.
+// Books that have never gone off-pace have no reactivatedDate, so this is a
+// no-op for them — every missed chunk they have already belongs to their
+// one and only attempt.
+function isChunkFromCurrentAttempt(chunk, book) {
+  return !book.reactivatedDate || chunk.scheduledDate >= book.reactivatedDate;
 }
 
 // A book's status badge reflects whether the reader is CURRENTLY caught up,
@@ -307,23 +339,32 @@ function isChunkMissed(chunk, today) {
 // logic fell through to 'on-track' by default, which read as a hollow,
 // dishonest badge on a book that hasn't begun. Checked before the missed-
 // chunk logic since a future-start book by definition has nothing missed.
-function getBookStatus(book, chunks) {
+function getBookStatus(book, chunks, readingDays) {
   if (book.status === 'planned') return 'planned';
   if (book.status === 'complete') return 'complete';
+  // Archived books have no live pace. Their old schedule keeps its dates
+  // while archived, so running the math below would report days missed
+  // while the book was set aside. (v1.3.2)
+  if (book.status === 'archived') return 'archived';
 
   const today = versoToday();
   if (book.startDate && book.startDate > today) return 'not-started';
 
+  if (isOffPace(book, readingDays)) return 'off-pace';
+
   const bookChunks = chunks.filter(c => c.bookId === book.id);
 
-  const missedChunks = bookChunks.filter(c => isChunkMissed(c, today));
+  const missedChunks = bookChunks.filter(c => isChunkMissed(c, today) && isChunkFromCurrentAttempt(c, book));
 
   if (missedChunks.length === 0) return 'on-track';
 
   // Pages scheduled to have been read by today (complete + missed chunks —
-  // i.e. every chunk whose scheduledDate is today or earlier)
+  // i.e. every chunk whose scheduledDate is today or earlier). Complete
+  // chunks always count regardless of attempt — real reading is real
+  // reading — but missed chunks are restricted to the current attempt the
+  // same way as above, for the same reason.
   const dueByToday = bookChunks
-    .filter(c => c.status === 'complete' || isChunkMissed(c, today))
+    .filter(c => c.status === 'complete' || (isChunkMissed(c, today) && isChunkFromCurrentAttempt(c, book)))
     .reduce((sum, c) => sum + (c.pagesEnd - c.pagesStart + 1), 0);
 
   const pagesRead = bookChunks
@@ -335,6 +376,14 @@ function getBookStatus(book, chunks) {
   return missedChunks.length <= 2 ? 'behind' : 'at-risk';
 }
 
+// A finished book stays finished after it's archived. Counts such as
+// "Books finished this year" and the completion shelf use this so
+// archiving a completed book doesn't remove it from them. (v1.3.2)
+function versoIsFinishedBook(book) {
+  if (book.status === 'complete') return true;
+  return book.status === 'archived' && book.statusBeforeArchive === 'complete';
+}
+
 // ── Shared status/date display helpers (used by both dashboard and book view) ──
 
 function versoFormatDate(dateString) {
@@ -344,7 +393,7 @@ function versoFormatDate(dateString) {
 }
 
 // Like versoFormatDate, but includes the year — used for date ranges where
-// the year isn't otherwise implied (e.g. the semester view's header).
+// the year isn't otherwise implied (e.g. the Add book confirm step).
 function versoFormatDateLong(dateString) {
   if (!dateString) return '—';
   const date = new Date(dateString + 'T00:00:00');
@@ -355,9 +404,11 @@ function versoBadgeLabelForStatus(status) {
   if (status === 'on-track') return 'On track';
   if (status === 'behind') return 'Behind';
   if (status === 'at-risk') return 'At risk';
+  if (status === 'off-pace') return 'Off pace';
   if (status === 'planned') return 'Planned';
   if (status === 'complete') return 'Completed';
   if (status === 'not-started') return 'Not started';
+  if (status === 'archived') return 'Archived';
   return status;
 }
 
@@ -365,9 +416,11 @@ function versoBadgeClassForStatus(status) {
   if (status === 'on-track') return 'verso-badge-on-track';
   if (status === 'behind') return 'verso-badge-behind-soft';
   if (status === 'at-risk') return 'verso-badge-behind';
+  if (status === 'off-pace') return 'verso-badge-off-pace';
   if (status === 'planned') return 'verso-badge-planned';
   if (status === 'complete') return 'verso-badge-complete';
   if (status === 'not-started') return 'verso-badge-not-started';
+  if (status === 'archived') return 'verso-badge-planned';
   return '';
 }
 
@@ -375,11 +428,74 @@ function versoBarClassForStatus(status) {
   if (status === 'on-track') return 'verso-bar-on-track';
   if (status === 'behind') return 'verso-bar-behind';
   if (status === 'at-risk') return 'verso-bar-at-risk';
+  if (status === 'off-pace') return 'verso-bar-off-pace';
   if (status === 'planned') return 'verso-bar-planned';
   if (status === 'complete') return 'verso-bar-complete';
-  if (status === 'not-started') return 'verso-bar-not-started';
+  // 'not-started' intentionally omitted: the progress bar row this class
+  // would apply to is gated by `if (progress)` at its only call site, and
+  // progress is null precisely when a book is not-started — this branch
+  // was confirmed unreachable and had no matching CSS rule either.
+  // Removed per issue #5 (LiveAQuietLife, 2026-09-05).
   return '';
 }
+
+// ── Shared vocabulary helpers ───────────────────────────────────────────────
+//
+// The collection term is reader-configurable, so its plural, singular,
+// capitalized and example-name forms are needed across several views and
+// modals. They live at module scope so there is exactly one definition of
+// each; earlier versions carried per-class copies that had already drifted.
+
+// Plural form — 'lists', 'shelves', or the reader's own word.
+function versoCollectionTerm(settings) {
+  if (settings.collectionTerm === 'custom') {
+    return settings.collectionTermCustomPlural || settings.collectionTermCustom || 'collections';
+  }
+  return settings.collectionTerm;
+}
+
+// Singular form. Built-in terms come from the map below. A custom term uses
+// the singular the reader supplied rather than guessing at English
+// morphology, falling back to the plural unchanged if they left it blank.
+function versoCollectionTermSingular(settings) {
+  if (settings.collectionTerm === 'custom') {
+    return settings.collectionTermCustom
+      || settings.collectionTermCustomPlural
+      || 'collection';
+  }
+  return versoSingularize(settings.collectionTerm);
+}
+
+// Only ever handles the built-in terms — see versoCollectionTermSingular.
+function versoSingularize(term) {
+  const map = {
+    projects: 'project',
+    lists: 'list',
+    shelves: 'shelf'
+  };
+  return map[term] || term;
+}
+
+function versoCapitalize(str) {
+  if (!str) return str;
+  return str.charAt(0).toUpperCase() + str.slice(1);
+}
+
+function versoExampleCollectionName(term) {
+  const examples = {
+    projects: 'Summer reading',
+    lists: 'To read',
+    shelves: 'Currently reading'
+  };
+  return examples[term] || 'New collection';
+}
+
+function versoAddSummaryRow(table, label, value) {
+  const row = table.createDiv({ cls: 'verso-summary-row' });
+  row.createEl('span', { text: label, cls: 'verso-summary-label' });
+  row.createEl('span', { text: value, cls: 'verso-summary-value' });
+}
+
 
 // ─── Scheduling Engine ────────────────────────────────────────────────────────
 //
@@ -407,10 +523,63 @@ function getReadingDateRange(startDate, endDate, readingDays) {
   return dates;
 }
 
-// Build a default label for a chunk based on its page range
-function buildChunkLabel(pagesStart, pagesEnd) {
+// Build a default label for a chunk based on its page range.
+//
+// `book` is optional so every existing call site keeps working unchanged;
+// pass it to get the percent-mode label. For a percent-mode book, the
+// label is a single flat target percent (e.g. "42%"), not a start-end
+// range — a range degenerates to something like "30%-30%" whenever the
+// daily pace rounds to the same whole percent, which reads as sloppy
+// rather than informative. See verso-workflow-notes issue on percent-based
+// progress tracking. (LiveAQuietLife, 2026-09-04)
+function buildChunkLabel(pagesStart, pagesEnd, book) {
+  if (book && book.progressInputMode === 'percent' && book.totalPages > 0) {
+    const targetPercent = Math.round((pagesEnd / book.totalPages) * 100);
+    return `${targetPercent}%`;
+  }
   if (pagesStart === pagesEnd) return `p. ${pagesStart}`;
   return `pp. ${pagesStart}-${pagesEnd}`;
+}
+
+// Title-case for book titles: capitalizes every word except a fixed list
+// of minor words (articles, short conjunctions/prepositions) — unless
+// that minor word is the first or last word of the title, which is always
+// capitalized regardless. Standard title-case convention.
+//
+// Known limitation: this can't know about names with internal capitals
+// ("McDonald", "MacArthur") — those come out as "Mcdonald" /
+// "Macarthur". No general fix without a name database; flagging rather
+// than hiding it. (LiveAQuietLife, 2026-09-05)
+const VERSO_TITLE_MINOR_WORDS = new Set([
+  'a', 'an', 'the', 'and', 'but', 'or', 'nor', 'for', 'so', 'yet',
+  'as', 'at', 'by', 'in', 'of', 'on', 'per', 'to', 'up', 'via', 'vs'
+]);
+
+function versoCapitalizeWord(word) {
+  // Capitalize each segment around hyphens/apostrophes so "o'brien" ->
+  // "O'Brien" and "jean-claude" -> "Jean-Claude" come out right.
+  return word.split(/([-'])/).map(seg => {
+    if (seg === '-' || seg === "'") return seg;
+    if (seg.length === 0) return seg;
+    return seg.charAt(0).toUpperCase() + seg.slice(1).toLowerCase();
+  }).join('');
+}
+
+function versoTitleCase(str) {
+  if (!str) return str;
+  const words = str.trim().split(/\s+/);
+  return words.map((word, i) => {
+    const isEdge = i === 0 || i === words.length - 1;
+    if (!isEdge && VERSO_TITLE_MINOR_WORDS.has(word.toLowerCase())) {
+      return word.toLowerCase();
+    }
+    return versoCapitalizeWord(word);
+  }).join(' ');
+}
+
+function versoNameCase(str) {
+  if (!str) return str;
+  return str.trim().split(/\s+/).map(versoCapitalizeWord).join(' ');
 }
 
 // Distribute a page range evenly across a list of dates.
@@ -449,19 +618,30 @@ function distributePages(firstPage, totalPages, dates) {
   return result;
 }
 
+// The first date a new schedule can use: the start date, or today if the
+// start date is in the past. Days before today can't be read any more, so
+// scheduling pages on them only produced instant "missed" days and an
+// at-risk badge on a book that was just added. (v1.3.2) The book keeps its
+// real startDate; only the schedule begins today.
+function versoScheduleFrom(startDate) {
+  const today = versoToday();
+  return startDate < today ? today : startDate;
+}
+
 // Generate the full initial schedule for a newly added book.
 // Returns an array of chunk data objects ready to pass to createChunk().
 function generateSchedule(book, readingDays) {
-  const dates = getReadingDateRange(book.startDate, book.targetFinishDate, readingDays);
+  const from = versoScheduleFrom(book.startDate);
+  const dates = getReadingDateRange(from, book.targetFinishDate, readingDays);
 
   if (dates.length === 0) {
-    // No valid reading days in range — single chunk on the start date
+    // No valid reading days in range — single chunk on the first schedulable date
     return [{
       bookId: book.id,
-      label: buildChunkLabel(1, book.totalPages),
+      label: buildChunkLabel(1, book.totalPages, book),
       pagesStart: 1,
       pagesEnd: book.totalPages,
-      scheduledDate: book.startDate,
+      scheduledDate: from,
       status: 'upcoming'
     }];
   }
@@ -470,7 +650,7 @@ function generateSchedule(book, readingDays) {
 
   return distributed.map(d => ({
     bookId: book.id,
-    label: buildChunkLabel(d.pagesStart, d.pagesEnd),
+    label: buildChunkLabel(d.pagesStart, d.pagesEnd, book),
     pagesStart: d.pagesStart,
     pagesEnd: d.pagesEnd,
     scheduledDate: d.scheduledDate,
@@ -493,6 +673,40 @@ function generateSchedule(book, readingDays) {
 // "complete" + "upcoming" chunks, never "missed" — otherwise pages get
 // double-counted.
 //
+// Deterministic id for a chunk generated by recalculateSchedule. Random ids
+// meant every recalculation produced "new" data even when the schedule was
+// identical, so data.json was rewritten on every startup — on every device —
+// which is what produced the stream of data.sync-conflict files. With a
+// stable id, the same schedule always serializes the same way, so
+// recalculateBook() can detect "nothing changed" and skip the write, and two
+// devices that do recalculate on the same day write byte-identical data.
+// Unique by construction: a book never has two upcoming chunks on one date.
+function versoScheduledChunkId(bookId, scheduledDate, pagesStart, pagesEnd) {
+  return `${bookId}-${scheduledDate}-${pagesStart}-${pagesEnd}`;
+}
+
+// True if two chunk lists contain the same chunks with the same field
+// values, regardless of order. Used to skip saving when a recalculation
+// changed nothing.
+function versoChunkSetsEqual(a, b) {
+  if (a.length !== b.length) return false;
+  const byId = new Map(a.map(c => [c.id, c]));
+  return b.every(c => {
+    const other = byId.get(c.id);
+    if (!other) return false;
+    const keys = new Set([...Object.keys(c), ...Object.keys(other)]);
+    for (const key of keys) {
+      // Treat a missing field and a null one as the same thing — chunks
+      // built by createChunk carry e.g. scheduledPagesEnd: null, while
+      // recalculated ones omit it.
+      const x = c[key] === undefined ? null : c[key];
+      const y = other[key] === undefined ? null : other[key];
+      if (x !== y) return false;
+    }
+    return true;
+  });
+}
+
 // Returns the updated full list of chunks for this book (complete + missed + upcoming).
 function recalculateSchedule(book, existingChunks, readingDays) {
   const today = versoToday();
@@ -505,13 +719,13 @@ function recalculateSchedule(book, existingChunks, readingDays) {
   // fresh from startDate. This also self-heals books affected by the
   // phantom-chunk bug below (chunks dated before startDate that had been
   // incorrectly marked missed).
-  if (book.startDate > today) {
+  if (book.startDate > today && !existingChunks.some(c => c.status === 'complete')) {
     const dates = getReadingDateRange(book.startDate, book.targetFinishDate, readingDays);
     const distributed = distributePages(1, book.totalPages, dates);
     return distributed.map(d => ({
-      id: generateId(),
+      id: versoScheduledChunkId(book.id, d.scheduledDate, d.pagesStart, d.pagesEnd),
       bookId: book.id,
-      label: buildChunkLabel(d.pagesStart, d.pagesEnd),
+      label: buildChunkLabel(d.pagesStart, d.pagesEnd, book),
       chapterTitle: '',
       pagesStart: d.pagesStart,
       pagesEnd: d.pagesEnd,
@@ -524,6 +738,35 @@ function recalculateSchedule(book, existingChunks, readingDays) {
   const completeChunks = existingChunks.filter(c => c.status === 'complete');
   const upcomingChunks = existingChunks.filter(c => c.status === 'upcoming');
   const alreadyMissedChunks = existingChunks.filter(c => c.status === 'missed');
+
+  // OFF-PACE FREEZE (see Verso future-works §1.1–§1.4): once the target finish
+  // date has no reading day left before it, there is no sane way to
+  // distribute the remaining pages. The old behavior collapsed everything
+  // onto today, which produced a chunk sized to the whole remaining book —
+  // and regenerated an equally-sized "new" one every subsequent session,
+  // since nothing about the collapse depends on time actually passing. That
+  // was the direct cause of the missed-day/page inflation in §1.2/§1.3 and
+  // the destructive same-click completion in §1.4.
+  //
+  // Instead: mark anything still overdue as missed ONE FINAL TIME, and
+  // generate nothing new. The book stays exactly as it is — pagesRead
+  // untouched, existing history untouched — until the reader sets a new
+  // target date. At that point updateBookDates() calls this function again
+  // with a real target date ahead of today, isOffPace() is no longer true,
+  // and the normal distribution below picks up from pagesRead + 1 across the
+  // new window — a fresh schedule for what's actually left, not a redo of
+  // the whole book. This freeze is naturally idempotent: once there are no
+  // upcoming chunks left to convert, re-running it changes nothing.
+  if (isOffPace(book, readingDays)) {
+    const lastPageRead = completeChunks.length > 0
+      ? Math.max(...completeChunks.map(c => c.pagesEnd))
+      : 0;
+    const missedChunks = [
+      ...alreadyMissedChunks,
+      ...upcomingChunks.map(c => ({ ...c, status: 'missed' }))
+    ].filter(c => c.pagesEnd > lastPageRead);
+    return [...completeChunks, ...missedChunks];
+  }
 
   // Split upcoming into "now overdue" (becomes missed) vs "still upcoming"
   const newlyMissed = upcomingChunks.filter(c => c.scheduledDate < today);
@@ -557,22 +800,24 @@ function recalculateSchedule(book, existingChunks, readingDays) {
   // longer counts as an available slot for redistribution.
   //
   // (Books that haven't started yet — book.startDate > today — are handled
-  // by the early return above, so by this point book.startDate <= today.)
+  // by the early return above, so by this point book.startDate <= today.
+  // Books with no reading days left at all are handled by the off-pace
+  // freeze above, so remainingDates below is never empty by construction —
+  // no [today] collapse fallback needed, and none is provided: an empty
+  // range should mean "generate nothing," which distributePages already
+  // does on its own for an empty dates array.)
   const usedDates = new Set(completeChunks.map(c => c.scheduledDate));
   const remainingDates = getReadingDateRange(today, book.targetFinishDate, readingDays)
     .filter(date => !usedDates.has(date));
 
-  // If somehow there are no remaining dates (e.g. overdue), fall back to just "today"
-  const dates = remainingDates.length > 0 ? remainingDates : [today];
-
   // Redistribute remaining pages across remaining dates
   const firstPage = pagesRead + 1;
-  const distributed = distributePages(firstPage, remainingPages, dates);
+  const distributed = distributePages(firstPage, remainingPages, remainingDates);
 
   const newUpcoming = distributed.map(d => ({
-    id: generateId(),
+    id: versoScheduledChunkId(book.id, d.scheduledDate, d.pagesStart, d.pagesEnd),
     bookId: book.id,
-    label: buildChunkLabel(d.pagesStart, d.pagesEnd),
+    label: buildChunkLabel(d.pagesStart, d.pagesEnd, book),
     chapterTitle: '',
     pagesStart: d.pagesStart,
     pagesEnd: d.pagesEnd,
@@ -586,6 +831,107 @@ function recalculateSchedule(book, existingChunks, readingDays) {
 
 // ─── Plugin ──────────────────────────────────────────────────────────────────
 
+// ─── Mobile keyboard ────────────────────────────────────────────────────────
+//
+// GitHub #2 / logic-notes #7. On mobile the on-screen keyboard is drawn
+// over the page instead of shrinking it, so a short, centered modal can
+// end up with its field under the keyboard. There's nothing to scroll in
+// a short modal, so Verso moves the modal itself up with a transform, by
+// exactly how far the keyboard covers the focused field. A transform
+// doesn't change layout, so Obsidian's own modal sizing is untouched, and
+// a tall modal whose field is already visible computes zero and doesn't
+// move. Only Verso's own modals are affected. (v1.3.2)
+//
+// The keyboard's top edge comes from the keyboard events Obsidian's
+// mobile app fires (keyboardHeight), falling back to visualViewport when
+// those aren't available.
+class VersoKeyboardAvoider {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.keyboardHeight = 0;
+    this.shiftedModal = null;
+    this.update = this.update.bind(this);
+  }
+
+  start() {
+    const plugin = this.plugin;
+    const onShow = (e) => {
+      const h = e && (e.keyboardHeight || (e.detail && e.detail.keyboardHeight));
+      if (h) this.keyboardHeight = h;
+      this.scheduleUpdate();
+    };
+    const onHide = () => {
+      this.keyboardHeight = 0;
+      this.reset();
+    };
+    ['keyboardWillShow', 'keyboardDidShow'].forEach(name => plugin.registerDomEvent(window, name, onShow));
+    ['keyboardWillHide', 'keyboardDidHide'].forEach(name => plugin.registerDomEvent(window, name, onHide));
+    plugin.registerDomEvent(document, 'focusin', () => this.scheduleUpdate());
+    plugin.registerDomEvent(document, 'focusout', () => this.scheduleUpdate());
+    if (window.visualViewport) {
+      plugin.registerDomEvent(window.visualViewport, 'resize', () => this.scheduleUpdate());
+    }
+    plugin.register(() => this.reset());
+  }
+
+  // The keyboard animates in, so measure again shortly after.
+  scheduleUpdate() {
+    window.requestAnimationFrame(this.update);
+    window.setTimeout(this.update, 300);
+  }
+
+  // Bottom edge of the area the keyboard leaves visible, in client pixels.
+  visibleBottom() {
+    const fromEvent = this.keyboardHeight > 0 ? window.innerHeight - this.keyboardHeight : Infinity;
+    const vv = window.visualViewport;
+    const fromViewport = vv ? vv.offsetTop + vv.height : Infinity;
+    return Math.min(fromEvent, fromViewport, window.innerHeight);
+  }
+
+  update() {
+    const el = document.activeElement;
+    const isField = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT');
+    const modal = isField ? el.closest('.modal') : null;
+    if (!modal || !modal.querySelector('[class*="verso-"]')) {
+      this.reset();
+      return;
+    }
+    if (this.shiftedModal && this.shiftedModal !== modal) this.reset();
+
+    const current = this.shiftedModal === modal ? (modal._versoShift || 0) : 0;
+    // Positions as if the modal weren't shifted.
+    const fieldBottom = el.getBoundingClientRect().bottom + current;
+    const modalTop = modal.getBoundingClientRect().top + current;
+    const margin = 16;
+    const overlap = fieldBottom + margin - this.visibleBottom();
+    // Never push the top of the modal off the screen.
+    const topLimit = Math.max(0, modalTop - margin);
+    const shift = Math.max(0, Math.min(overlap, topLimit));
+
+    if (shift === current) return;
+    if (shift === 0) {
+      this.reset();
+      return;
+    }
+    modal.style.transition = 'transform 0.15s ease-out';
+    modal.style.transform = `translateY(-${Math.round(shift)}px)`;
+    modal._versoShift = Math.round(shift);
+    this.shiftedModal = modal;
+  }
+
+  reset() {
+    const modal = this.shiftedModal;
+    if (!modal) return;
+    modal.style.transform = '';
+    modal._versoShift = 0;
+    this.shiftedModal = null;
+  }
+}
+
+// Backstop interval for noticing data.json changes from a sync tool. The
+// focus and visibility checks catch most changes right away. (v1.3.2)
+const VERSO_EXTERNAL_CHECK_MS = 5 * 60 * 1000;
+
 class VersoPlugin extends Plugin {
 
   async onload() {
@@ -594,6 +940,30 @@ class VersoPlugin extends Plugin {
 
     // Catch up any missed reading days and redistribute schedules
     await this.recalculateAllBooks();
+
+    // ...and do it again whenever the calendar day changes while Obsidian
+    // stays open (see checkDayRollover).
+    this.lastKnownDay = versoToday();
+    this.rolloverInProgress = false;
+    this.registerInterval(window.setInterval(() => this.checkDayRollover(), 60 * 1000));
+
+    // Pick up data.json changes written by a sync tool on another device
+    // (logic-notes #9). Checked when Obsidian regains focus or becomes
+    // visible again, which covers the usual case of picking up the other
+    // device, with a slower poll as a backstop. No file watcher: mobile
+    // doesn't support one. (v1.3.2)
+    this.externalCheckInProgress = false;
+    await this.rememberDataMtime();
+    this.registerDomEvent(window, 'focus', () => this.checkExternalDataChange());
+    this.registerDomEvent(document, 'visibilitychange', () => {
+      if (document.visibilityState === 'visible') this.checkExternalDataChange();
+    });
+    this.registerInterval(window.setInterval(() => this.checkExternalDataChange(), VERSO_EXTERNAL_CHECK_MS));
+
+    // Keep Verso's modal fields above the mobile keyboard (GitHub #2).
+    if (document.body.classList.contains('is-mobile')) {
+      new VersoKeyboardAvoider(this).start();
+    }
 
     this.registerView(
       VIEW_TYPE_VERSO_DASHBOARD,
@@ -649,7 +1019,7 @@ class VersoPlugin extends Plugin {
       id: 'verso-add-book',
       name: 'Add a book',
       callback: () => {
-        new AddBookModal(this.app, this, () => this.refreshOpenDashboard()).open();
+        new AddBookModal(this.app, this, () => this.refreshAllViews()).open();
       }
     });
 
@@ -665,7 +1035,7 @@ class VersoPlugin extends Plugin {
 
     // If the active tab is already a Verso view, swap it in place — avoids
     // piling up separate dashboard/book tabs as the user navigates between them.
-    const active = workspace.activeLeaf;
+    const active = this.getActiveLeaf();
     if (active && this.isVersoLeaf(active)) {
       await active.setViewState({ type: VIEW_TYPE_VERSO_DASHBOARD, active: true });
       workspace.revealLeaf(active);
@@ -681,6 +1051,13 @@ class VersoPlugin extends Plugin {
     const leaf = workspace.getLeaf('tab');
     await leaf.setViewState({ type: VIEW_TYPE_VERSO_DASHBOARD, active: true });
     workspace.revealLeaf(leaf);
+  }
+
+  // The leaf of the active view. Replaces workspace.activeLeaf, which
+  // Obsidian has deprecated. (v1.3.2)
+  getActiveLeaf() {
+    const view = this.app.workspace.getActiveViewOfType(ItemView);
+    return view ? view.leaf : null;
   }
 
   // True if the given leaf is currently showing a Verso dashboard, book, or
@@ -745,7 +1122,7 @@ class VersoPlugin extends Plugin {
     const { workspace } = this.app;
     const state = { bookId, fromView: fromView || null, fromTab: fromTab || null };
 
-    const active = workspace.activeLeaf;
+    const active = this.getActiveLeaf();
     if (active && this.isVersoLeaf(active)) {
       await active.setViewState({
         type: VIEW_TYPE_VERSO_BOOK,
@@ -773,7 +1150,7 @@ class VersoPlugin extends Plugin {
     const { workspace } = this.app;
     const state = activeTab ? { activeTab } : undefined;
 
-    const active = workspace.activeLeaf;
+    const active = this.getActiveLeaf();
     if (active && this.isVersoLeaf(active)) {
       await active.setViewState({
         type: VIEW_TYPE_VERSO_LIBRARY,
@@ -821,6 +1198,11 @@ class VersoPlugin extends Plugin {
     // actually rescheduled before this fix shipped will look unrescheduled
     // going forward; accepted, since there's no way to recover the true
     // original date for those books.
+    // Own copy, so pushing to it never touches DEFAULT_SETTINGS.
+    this.settings.quotesShown = Array.isArray(this.settings.quotesShown)
+      ? [...this.settings.quotesShown]
+      : [];
+
     this.settings.books.forEach(book => {
       if (!book.originalTargetFinishDate) {
         book.originalTargetFinishDate = book.targetFinishDate;
@@ -829,7 +1211,61 @@ class VersoPlugin extends Plugin {
   }
 
   async saveSettings() {
-    await this.saveData(this.settings);
+    // While Verso's own write is in flight, the file's time has changed
+    // but lastDataMtime hasn't caught up, so the external check would
+    // mistake it for a sync write. saveDepth tells it to wait.
+    this.saveDepth = (this.saveDepth || 0) + 1;
+    try {
+      await this.saveData(this.settings);
+      await this.rememberDataMtime();
+    } finally {
+      this.saveDepth--;
+    }
+  }
+
+  // ── External changes to data.json (sync) ────────────────────
+
+  dataFilePath() {
+    return `${this.manifest.dir}/data.json`;
+  }
+
+  // Records data.json's modified time after Verso's own load or save, so
+  // only writes from outside Verso count as external changes.
+  async rememberDataMtime() {
+    try {
+      const stat = await this.app.vault.adapter.stat(this.dataFilePath());
+      this.lastDataMtime = stat ? stat.mtime : null;
+    } catch (e) {
+      this.lastDataMtime = null;
+    }
+  }
+
+  async checkExternalDataChange() {
+    if (this.externalCheckInProgress || this.saveDepth > 0 || this.rolloverInProgress) return;
+    this.externalCheckInProgress = true;
+    try {
+      const stat = await this.app.vault.adapter.stat(this.dataFilePath());
+      if (!stat || stat.mtime === this.lastDataMtime) return;
+      await this.reloadFromDisk();
+    } catch (e) {
+      console.error('Verso: could not check data.json for outside changes.', e);
+    } finally {
+      this.externalCheckInProgress = false;
+    }
+  }
+
+  // Obsidian calls this when it notices data.json changed on disk.
+  async onExternalSettingsChange() {
+    await this.checkExternalDataChange();
+  }
+
+  // Replace the in-memory data with what's on disk, bring schedules up to
+  // today, and redraw every open view.
+  async reloadFromDisk() {
+    await this.loadSettings();
+    await this.rememberDataMtime();
+    await this.recalculateAllBooks();
+    this.refreshAllViews();
   }
 
   // ── Collection helpers ──────────────────────────────────────
@@ -853,12 +1289,16 @@ class VersoPlugin extends Plugin {
     return this.settings.collections[index];
   }
 
+  // Deleting a collection removes only the collection. Its books stay,
+  // with no collection. (Earlier versions deleted every book in it, along
+  // with their schedules. No UI calls this yet.) (v1.3.2)
   async deleteCollection(id) {
-    const bookIds = this.settings.books.filter(b => b.collectionId === id).map(b => b.id);
     this.settings.collections = this.settings.collections.filter(c => c.id !== id);
-    this.settings.books = this.settings.books.filter(b => b.collectionId !== id);
-    this.settings.chunks = this.settings.chunks.filter(c => !bookIds.includes(c.bookId));
+    this.settings.books.forEach(b => {
+      if (b.collectionId === id) b.collectionId = null;
+    });
     await this.saveSettings();
+    this.refreshAllViews();
   }
 
   // ── Book helpers ────────────────────────────────────────────
@@ -907,10 +1347,18 @@ class VersoPlugin extends Plugin {
     return this.settings.books[index];
   }
 
+  // Removes the book, its chunks, its sessions, and its place in any
+  // collection's book list. (Sessions and collection references used to
+  // be left behind.) Refreshes every open view. (v1.3.2)
   async deleteBook(id) {
     this.settings.books = this.settings.books.filter(b => b.id !== id);
     this.settings.chunks = this.settings.chunks.filter(c => c.bookId !== id);
+    this.settings.sessions = (this.settings.sessions || []).filter(s => s.bookId !== id);
+    this.settings.collections.forEach(c => {
+      if (Array.isArray(c.books)) c.books = c.books.filter(bookId => bookId !== id);
+    });
     await this.saveSettings();
+    this.refreshAllViews();
   }
 
   // Archive: hide from the dashboard but keep all data, recoverable via
@@ -923,33 +1371,57 @@ class VersoPlugin extends Plugin {
   async archiveBook(id, reasonData = {}) {
     const book = this.getBook(id);
     const statusBeforeArchive = book && book.status !== 'archived' ? book.status : 'active';
-    return this.updateBook(id, {
+    const archived = await this.updateBook(id, {
       status: 'archived',
       statusBeforeArchive,
       archivedDate: new Date().toISOString(),
       archiveReason: reasonData.archiveReason || '',
       archiveReasonCategory: reasonData.archiveReasonCategory || null
     });
+    this.refreshAllViews();
+    return archived;
   }
 
   // Edit the reason on an already-archived book (does not touch archivedDate).
   async updateArchiveReason(id, reasonData = {}) {
-    return this.updateBook(id, {
+    const updated = await this.updateBook(id, {
       archiveReason: reasonData.archiveReason || '',
       archiveReasonCategory: reasonData.archiveReasonCategory || null
     });
+    this.refreshAllViews();
+    return updated;
   }
 
-  async restoreBook(id) {
+  // newTargetFinishDate (optional, v1.3.2): for an active book whose
+  // timeline had already begun. Sets the new finish date and stamps today
+  // as reactivatedDate, so reading days that passed while the book sat in
+  // the archive are kept as history but don't count against its status or
+  // pace (see isChunkFromCurrentAttempt). Recalculates before returning.
+  async restoreBook(id, newTargetFinishDate) {
     const book = this.getBook(id);
     const restoredStatus = (book && book.statusBeforeArchive) || 'active';
-    return this.updateBook(id, {
+    const updates = {
       status: restoredStatus,
       statusBeforeArchive: null,
       archivedDate: null,
       archiveReason: '',
       archiveReasonCategory: null
-    });
+    };
+    if (newTargetFinishDate && restoredStatus === 'active') {
+      updates.targetFinishDate = newTargetFinishDate;
+      updates.reactivatedDate = versoToday();
+    }
+    const restored = await this.updateBook(id, updates);
+    await this.recalculateBook(id);
+    this.refreshAllViews();
+    return restored;
+  }
+
+  // Restore needs a new finish date only for an active book whose schedule
+  // had already started; its old plan kept running while it was archived.
+  restoreNeedsNewFinishDate(book) {
+    const restoredStatus = book.statusBeforeArchive || 'active';
+    return restoredStatus === 'active' && !!book.startDate && book.startDate < versoToday();
   }
 
   getArchivedBooks() {
@@ -968,21 +1440,30 @@ class VersoPlugin extends Plugin {
     if (!book) return null;
 
     await this.buildScheduleForBook(bookId);
+    this.refreshAllViews();
     return this.getBook(bookId);
   }
 
-  // Update an active book's schedule: dates and/or reading days.
-  //  - If the book's timeline hasn't begun yet (startDate is today or in the
-  //    future), startDate, targetFinishDate, AND readingDaysOverride can all
-  //    change — the schedule is fully rebuilt from scratch, same as initial
-  //    activation.
-  //  - Once startDate is in the past, the book's timeline has begun: startDate
-  //    becomes immutable (it's a historical fact, and the existing schedule may
+  // Update a book's schedule: dates and/or reading days. Three cases:
+  //  - Planned book: no schedule exists yet, and building one here would
+  //    silently activate the book behind the reader's back. targetFinishDate
+  //    and readingDaysOverride are stored as preferences that activateBook()
+  //    consumes later; startDate is ignored entirely, because a planned book
+  //    doesn't have one until activation deliberately sets it. (Note that
+  //    without this branch a planned book's null startDate would fail the
+  //    `< versoToday()` test below and fall into the rebuild path.)
+  //  - Active, timeline not begun (startDate is today or in the future):
+  //    startDate, targetFinishDate, AND readingDaysOverride can all change —
+  //    the schedule is fully rebuilt from scratch, same as initial activation.
+  //  - Active, timeline begun (startDate in the past): startDate becomes
+  //    immutable (it's a historical fact, and the existing schedule may
   //    carry "missed" chunks recording that history — rebuilding from scratch
   //    would erase them). targetFinishDate and readingDaysOverride can still
   //    change, and recalculateSchedule() redistributes the remaining pages
   //    forward (across the new reading days, if changed) while preserving
-  //    complete/missed chunks.
+  //    complete/missed chunks. If this edit pulls the book OUT of off-pace
+  //    (see isOffPace), today is stamped as reactivatedDate — see
+  //    isChunkFromCurrentAttempt for what that changes.
   //  - readingDaysOverride is optional (undefined = leave unchanged) so
   //    callers that only touch dates don't need to pass it.
   // Returns the updated book, or null if the book doesn't exist.
@@ -990,15 +1471,54 @@ class VersoPlugin extends Plugin {
     const book = this.getBook(bookId);
     if (!book) return null;
 
-    const timelineStarted = book.startDate < versoToday();
     const dateUpdates = { targetFinishDate };
     if (readingDaysOverride !== undefined) dateUpdates.readingDaysOverride = readingDaysOverride;
+
+    // Planned books never touch the chunk-building machinery from here.
+    // Same self-protection recalculateBook() already applies.
+    if (book.status === 'planned') {
+      await this.updateBook(bookId, dateUpdates);
+      return this.getBook(bookId);
+    }
+
+    // A scheduled book can't lose its dates — an empty finish (or start)
+    // date would wipe every upcoming reading day. The edit form blocks
+    // this too; this guards every other caller. (v1.3.2)
+    if (!targetFinishDate || (!this.hasBookStarted(book) && !startDate)) {
+      return book;
+    }
+
+    const timelineStarted = this.hasBookStarted(book);
 
     if (!timelineStarted) {
       dateUpdates.startDate = startDate;
       await this.updateBook(bookId, dateUpdates);
       await this.buildScheduleForBook(bookId);
     } else {
+      // Detect an off-pace → active transition BEFORE applying the update,
+      // using the book's actual current state. If the reader is setting a
+      // new date that pulls the book out of off-pace, stamp today as the
+      // start of a fresh reading attempt — every missed chunk from before
+      // this date stops counting toward status/progress math (see
+      // isChunkFromCurrentAttempt) without ever being deleted. A book that
+      // wasn't off-pace, or one whose new date still leaves it off-pace,
+      // gets no stamp at all; this is a no-op for the common case of just
+      // nudging a healthy book's date around.
+      const oldReadingDays = this.getReadingDaysFor(book);
+      const wasOffPace = isOffPace(book, oldReadingDays);
+
+      const previewBook = {
+        ...book,
+        targetFinishDate,
+        readingDaysOverride: readingDaysOverride !== undefined ? readingDaysOverride : book.readingDaysOverride
+      };
+      const newReadingDays = this.getReadingDaysFor(previewBook);
+      const willBeOffPace = isOffPace(previewBook, newReadingDays);
+
+      if (wasOffPace && !willBeOffPace) {
+        dateUpdates.reactivatedDate = versoToday();
+      }
+
       await this.updateBook(bookId, dateUpdates);
       await this.recalculateBook(bookId);
     }
@@ -1007,6 +1527,34 @@ class VersoPlugin extends Plugin {
   }
 
   // ── Scheduling ──────────────────────────────────────────────
+
+  // True once a book's schedule has begun: its start date has passed, or
+  // any reading has been logged (a book started today can already have
+  // today's reading marked). Deciding by date alone let an edit to a book
+  // that started today rebuild its schedule from scratch and erase that
+  // day's logged reading. (v1.3.2)
+  hasBookStarted(book) {
+    if (!book || !book.startDate) return false;
+    if (book.startDate < versoToday()) return true;
+    return this.settings.chunks.some(c => c.bookId === book.id && c.status === 'complete');
+  }
+
+  // Rebuild the stored label on every chunk of a book, e.g. "pp. 41-60"
+  // or "23%", from its current mode and page count.
+  async relabelChunks(bookId) {
+    const book = this.getBook(bookId);
+    if (!book) return;
+    let changed = false;
+    this.settings.chunks.forEach(c => {
+      if (c.bookId !== bookId) return;
+      const label = buildChunkLabel(c.pagesStart, c.pagesEnd, book);
+      if (c.label !== label) {
+        c.label = label;
+        changed = true;
+      }
+    });
+    if (changed) await this.saveSettings();
+  }
 
   // Get the effective reading-days setting for a book (its override, or the global default)
   getReadingDaysFor(book) {
@@ -1035,29 +1583,98 @@ class VersoPlugin extends Plugin {
   // Recalculate one book's schedule — marks overdue chunks as missed and
   // redistributes remaining pages across remaining reading days.
   async recalculateBook(bookId) {
+    if (this.recalculateBookInMemory(bookId)) {
+      await this.saveSettings();
+    }
+  }
+
+  // Recalculates one book's chunks in memory only. Returns true if the
+  // chunk set actually changed, false if the recalculation was a no-op.
+  // Callers decide whether (and how often) to save — see recalculateBook
+  // and recalculateAllBooks.
+  recalculateBookInMemory(bookId) {
     const book = this.getBook(bookId);
-    if (!book || book.status === 'complete' || book.status === 'planned') return;
+    if (!book || book.status === 'complete' || book.status === 'planned') return false;
 
     const existingChunks = this.getChunksForBook(bookId);
     const readingDays = this.getReadingDaysFor(book);
+
+    // A day selection with no days at all would make the book look
+    // off-pace and permanently freeze its upcoming chunks as 'missed'.
+    // Leave the schedule alone until a real selection exists.
+    if (typeof readingDays === 'object' && !Object.values(readingDays).some(v => v === true)) {
+      return false;
+    }
+
     const updatedChunks = recalculateSchedule(book, existingChunks, readingDays);
+
+    if (versoChunkSetsEqual(existingChunks, updatedChunks)) return false;
 
     // Replace this book's chunks with the recalculated set
     this.settings.chunks = this.settings.chunks.filter(c => c.bookId !== bookId);
     this.settings.chunks.push(...updatedChunks);
-
-    await this.saveSettings();
-    return updatedChunks;
+    return true;
   }
 
-  // Recalculate every active book — run on plugin load
+  // Recalculate every active book — run on plugin load, at day rollover, and
+  // when the global reading days change. Saves ONCE at the end, and only if
+  // at least one book's schedule actually changed: on a normal restart
+  // nothing has changed since the last recalculation, so data.json is left
+  // untouched (which is what keeps sync tools from producing conflicts).
   async recalculateAllBooks() {
     const activeBooks = this.settings.books.filter(b =>
       b.status !== 'complete' && b.status !== 'archived' && b.status !== 'planned'
     );
+    let anyChanged = false;
     for (const book of activeBooks) {
-      await this.recalculateBook(book.id);
+      if (this.recalculateBookInMemory(book.id)) anyChanged = true;
     }
+    if (anyChanged) await this.saveSettings();
+    return anyChanged;
+  }
+
+  // ── Day rollover ────────────────────────────────────────────
+  //
+  // Recalculation used to run only on plugin load, so with Obsidian left
+  // open overnight yesterday's unread pages weren't redistributed (and
+  // "today" in every view was stale) until a restart. Checked once a
+  // minute; cheap, since it's just a string compare until the date changes.
+  async checkDayRollover() {
+    const today = versoToday();
+    if (today === this.lastKnownDay || this.rolloverInProgress) return;
+    this.rolloverInProgress = true;
+    try {
+      this.lastKnownDay = today;
+      await this.recalculateAllBooks();
+      this.refreshAllViews();
+    } finally {
+      this.rolloverInProgress = false;
+    }
+  }
+
+  refreshBookAndLibraryViews() {
+    // Checking off a reading happens in the dashboard or sidebar, which
+    // refresh each other. Book and Library views show progress too, so
+    // they're refreshed here. (v1.3.2)
+    [VIEW_TYPE_VERSO_BOOK, VIEW_TYPE_VERSO_LIBRARY].forEach(type => {
+      this.app.workspace.getLeavesOfType(type).forEach(leaf => {
+        if (leaf.view && typeof leaf.view.render === 'function') leaf.view.render();
+      });
+    });
+  }
+
+  // Re-render every open Verso view (dashboard, sidebar, book, library).
+  // Called after any change that affects more than the view it came from:
+  // archive, restore, delete, Start reading, edits, adds. (v1.3.2)
+  refreshAllViews() {
+    [VIEW_TYPE_VERSO_DASHBOARD, VIEW_TYPE_VERSO_TODAY, VIEW_TYPE_VERSO_BOOK, VIEW_TYPE_VERSO_LIBRARY]
+      .forEach(type => {
+        this.app.workspace.getLeavesOfType(type).forEach(leaf => {
+          if (leaf.view && typeof leaf.view.render === 'function') {
+            leaf.view.render();
+          }
+        });
+      });
   }
 
   // ── Chunk helpers ───────────────────────────────────────────
@@ -1084,13 +1701,26 @@ class VersoPlugin extends Plugin {
   // Today sidebar (which calls getAllTodaysChunks() directly, with no filter
   // of its own) surfaced exactly this gap. Fixed at the source so every
   // current and future caller gets correct behavior automatically.
+  //
+  // Status filter is intentionally the explicit allow-list 'upcoming'
+  // (Complete added back in getAllTodaysChunks) rather than the looser
+  // "!== 'complete'" this used to be. Before the off-pace freeze existed, a
+  // 'missed' chunk was always dated in the past by construction, so it could
+  // never collide with a scheduledDate === today query — "not complete" and
+  // "upcoming" were equivalent in practice. The freeze branch in
+  // recalculateSchedule() broke that: it converts every still-upcoming chunk
+  // to 'missed' regardless of its date, including one dated exactly today,
+  // so a frozen off-pace book could show a "missed" chunk dated today that
+  // the old filter would still treat as actionable. Being explicit here
+  // means "actionable today" can never again silently include a status that
+  // was never meant to be actionable.
   getTodaysChunks() {
     const today = versoToday();
     const activeBookIds = new Set(
       this.settings.books.filter(b => b.status === 'active').map(b => b.id)
     );
     return this.settings.chunks.filter(c =>
-      c.scheduledDate === today && c.status !== 'complete' && activeBookIds.has(c.bookId)
+      c.scheduledDate === today && c.status === 'upcoming' && activeBookIds.has(c.bookId)
     );
   }
 
@@ -1101,12 +1731,18 @@ class VersoPlugin extends Plugin {
     const activeBookIds = new Set(
       this.settings.books.filter(b => b.status === 'active').map(b => b.id)
     );
-    return this.settings.chunks.filter(c => c.scheduledDate === today && activeBookIds.has(c.bookId));
+    return this.settings.chunks.filter(c =>
+      c.scheduledDate === today &&
+      (c.status === 'upcoming' || c.status === 'complete') &&
+      activeBookIds.has(c.bookId)
+    );
   }
 
   // Tomorrow's scheduled chunks, for the sidebar's read-ahead preview.
   // Includes chunks already completed (a reader who read ahead into
-  // tomorrow's pages today) — same inclusive shape as getAllTodaysChunks().
+  // tomorrow's pages today) — same inclusive shape as getAllTodaysChunks(),
+  // including the same explicit 'upcoming'/'complete' allow-list rather than
+  // an unfiltered pull by date alone.
   getTomorrowsChunks() {
     const tomorrow = new Date();
     tomorrow.setDate(tomorrow.getDate() + 1);
@@ -1114,7 +1750,11 @@ class VersoPlugin extends Plugin {
     const activeBookIds = new Set(
       this.settings.books.filter(b => b.status === 'active').map(b => b.id)
     );
-    return this.settings.chunks.filter(c => c.scheduledDate === tomorrowStr && activeBookIds.has(c.bookId));
+    return this.settings.chunks.filter(c =>
+      c.scheduledDate === tomorrowStr &&
+      (c.status === 'upcoming' || c.status === 'complete') &&
+      activeBookIds.has(c.bookId)
+    );
   }
 
 async markChunkComplete(chunkId, actualEnd = null) {
@@ -1134,7 +1774,7 @@ async markChunkComplete(chunkId, actualEnd = null) {
       const maxPage = book ? book.totalPages : actualEnd;
       chunk.scheduledPagesEnd = chunk.pagesEnd;
       chunk.pagesEnd = Math.max(chunk.pagesStart, Math.min(actualEnd, maxPage));
-      chunk.label = buildChunkLabel(chunk.pagesStart, chunk.pagesEnd);
+      chunk.label = buildChunkLabel(chunk.pagesStart, chunk.pagesEnd, book);
     }
 
     chunk.status = 'complete';
@@ -1161,6 +1801,7 @@ async markChunkComplete(chunkId, actualEnd = null) {
     // Check if the book is now fully complete
     const bookJustCompleted = await this.checkBookCompletion(chunk.bookId);
 
+    this.refreshBookAndLibraryViews();
     return { chunk, bookJustCompleted };
   }
 
@@ -1190,11 +1831,22 @@ async markChunkComplete(chunkId, actualEnd = null) {
     // Recalculate so the schedule reflects this chunk being outstanding again
     await this.recalculateBook(chunk.bookId);
 
+    this.refreshBookAndLibraryViews();
     return chunk;
   }
 
-  // Mark a book complete if all its pages have been read
-  async checkBookCompletion(bookId) {
+  // Mark a book complete if all its pages have been read.
+  //
+  // completionDate is optional. Omitted (the normal path, from
+  // markChunkComplete) it's "now" — correct, because the reader just
+  // finished the final chunk this moment. The Edit Book path passes an
+  // explicit date instead: correcting a 340-page book down to 300 means it
+  // was finished whenever the last chunk was actually logged, not the day
+  // the typo was noticed. This matters because the celebration shelf and
+  // the dashboard's "finished this year" count both filter by the YEAR of
+  // dateCompleted — a book finished Dec 28th and corrected Jan 3rd would
+  // otherwise jump to the wrong year.
+  async checkBookCompletion(bookId, completionDate) {
     const book = this.getBook(bookId);
     if (!book || book.status === 'complete') return false;
 
@@ -1205,7 +1857,7 @@ async markChunkComplete(chunkId, actualEnd = null) {
     if (pagesRead >= book.totalPages) {
       await this.updateBook(bookId, {
         status: 'complete',
-        dateCompleted: new Date().toISOString()
+        dateCompleted: completionDate || new Date().toISOString()
       });
       // A book can complete while still carrying leftover 'missed' or
       // 'upcoming' chunks — e.g. a reader falls behind, then catches up in
@@ -1222,6 +1874,19 @@ async markChunkComplete(chunkId, actualEnd = null) {
       return true;
     }
     return false;
+  }
+
+  // The date a book's reading actually ended: the latest dateCompleted
+  // across its complete chunks. Returns null if nothing has been logged,
+  // leaving the caller to fall back to "now".
+  lastChunkCompletionDate(bookId) {
+    const completed = this.getChunksForBook(bookId)
+      .filter(c => c.status === 'complete' && c.dateCompleted);
+    if (completed.length === 0) return null;
+    return completed.reduce(
+      (latest, c) => (c.dateCompleted > latest ? c.dateCompleted : latest),
+      completed[0].dateCompleted
+    );
   }
 
   // ── Progress helpers ────────────────────────────────────────
@@ -1249,12 +1914,56 @@ async markChunkComplete(chunkId, actualEnd = null) {
 
     const chunks = this.getChunksForBook(bookId);
     const completedChunks = chunks.filter(c => c.status === 'complete');
-    const today = versoToday();
-    const missedChunks = chunks.filter(c => isChunkMissed(c, today));
     const pagesRead = completedChunks.reduce((sum, c) => sum + (c.pagesEnd - c.pagesStart + 1), 0);
-    const missedPages = missedChunks.reduce((sum, c) => sum + (c.pagesEnd - c.pagesStart + 1), 0);
     const percentage = book.totalPages > 0 ? Math.round((pagesRead / book.totalPages) * 100) : 0;
     const readingDays = this.getReadingDaysFor(book);
+
+    // Archived books: real progress, but no pace, missed days, or catch-up
+    // line (see getBookStatus). Checked before off-pace so an archived book
+    // past its old finish date doesn't read "Target was ...". (v1.3.2)
+    if (book.status === 'archived') {
+      return {
+        bookId,
+        totalPages: book.totalPages,
+        pagesRead,
+        percentage,
+        chunksTotal: chunks.length,
+        chunksComplete: completedChunks.length,
+        missedDaysCount: 0,
+        missedPages: 0,
+        status: 'archived',
+        nextDueDate: null,
+        paceNeeded: 0
+      };
+    }
+
+    // Off-pace books (see isOffPace and the freeze branch in
+    // recalculateSchedule) have no schedule to report on until a new target
+    // date is set — real pagesRead/percentage are still honest and worth
+    // showing (the reader's actual progress doesn't stop being true just
+    // because the plan lapsed), but missedDaysCount/missedPages/paceNeeded
+    // would be summing inert historical chunks left over from before the
+    // freeze. Reporting them here would resurrect exactly the fabricated
+    // "X missed days" figure this whole fix exists to retire.
+    if (isOffPace(book, readingDays)) {
+      return {
+        bookId,
+        totalPages: book.totalPages,
+        pagesRead,
+        percentage,
+        chunksTotal: chunks.length,
+        chunksComplete: completedChunks.length,
+        missedDaysCount: 0,
+        missedPages: 0,
+        status: 'off-pace',
+        nextDueDate: null,
+        paceNeeded: 0
+      };
+    }
+
+    const today = versoToday();
+    const missedChunks = chunks.filter(c => isChunkMissed(c, today) && isChunkFromCurrentAttempt(c, book));
+    const missedPages = missedChunks.reduce((sum, c) => sum + (c.pagesEnd - c.pagesStart + 1), 0);
 
     // Earliest still-upcoming chunk's date, if any. Used by the dashboard to
     // distinguish "on track, with a chunk due today" from "on track, but
@@ -1276,7 +1985,7 @@ async markChunkComplete(chunkId, actualEnd = null) {
       chunksComplete: completedChunks.length,
       missedDaysCount: missedChunks.length,
       missedPages,
-      status: getBookStatus(book, this.settings.chunks),
+      status: getBookStatus(book, this.settings.chunks, readingDays),
       nextDueDate,
       paceNeeded: calculatePaceNeeded(
         book.totalPages,
@@ -1312,7 +2021,7 @@ async markChunkComplete(chunkId, actualEnd = null) {
 // Main dashboard, opened as its own workspace tab via ribbon icon or command.
 // Daily view: stat cards, today's reading (with completion checkboxes), and
 // book progress (status badges + progress bars). Empty state shown when no
-// books exist yet. Weekly/Monthly/Semester views are future work.
+// books exist yet. Weekly and monthly views are future work.
 
 const VIEW_TYPE_VERSO_DASHBOARD = 'verso-dashboard-view';
 
@@ -1364,15 +2073,13 @@ class VersoDashboardView extends ItemView {
     const iconCircle = wrap.createDiv({ cls: 'verso-empty-icon-circle' });
     iconCircle.createSpan({ text: '📖' });
 
-    const collectionTerm = this.singularize(this.getCollectionTerm());
-
     wrap.createEl('h2', {
-      text: `Ready to add your first ${collectionTerm}?`,
+      text: 'Ready to add your first book?',
       cls: 'verso-empty-title'
     });
 
     wrap.createEl('p', {
-      text: 'Add your books, set your deadlines, and Verso will map out exactly what to read each day. No more falling behind — just steady, satisfying progress.',
+      text: 'Add a book and a finish date. Verso handles the pages-per-day math, and redoes it whenever reality disagrees with the plan.',
       cls: 'verso-empty-description'
     });
 
@@ -1430,10 +2137,14 @@ class VersoDashboardView extends ItemView {
   }
 
   // Status priority for dashboard ordering: most-needs-attention first.
-  // at-risk/behind float to the top regardless of due date — a quietly
-  // at-risk book is more urgent information than a calmer one due sooner.
-  // on-track sits above not-started: real progress outranks "hasn't begun."
-  static STATUS_PRIORITY = { 'at-risk': 0, 'behind': 1, 'on-track': 2, 'not-started': 3 };
+  // off-pace sits above at-risk/behind — it's the one state that actively
+  // blocks reading until the reader sets a new date, so it's not just
+  // "more urgent," it's the one thing standing in the way of anything else
+  // happening with that book. at-risk/behind float next regardless of due
+  // date — a quietly at-risk book is more urgent information than a calmer
+  // one due sooner. on-track sits above not-started: real progress
+  // outranks "hasn't begun."
+  static STATUS_PRIORITY = { 'off-pace': 0, 'at-risk': 1, 'behind': 2, 'on-track': 3, 'not-started': 4 };
 
   renderDashboardBookCards(container) {
     container.empty();
@@ -1515,6 +2226,8 @@ class VersoDashboardView extends ItemView {
         const meta = row.createDiv({ cls: 'verso-today-meta' });
         meta.createSpan({ text: `${pages} page${pages === 1 ? '' : 's'}`, cls: 'verso-today-pages' });
 
+        versoMakeCheckboxAccessible(checkbox, chunk.status === 'complete', `${book.title}, ${chunk.label}`);
+
         // Only the checkbox itself toggles completion — the rest of the row
         // (title, pages) falls through to the card's "open book" click.
         // stopPropagation here keeps the toggle from also opening the book.
@@ -1531,9 +2244,7 @@ class VersoDashboardView extends ItemView {
               return { bookJustCompleted };
             }).open();
           } else {
-            await this.plugin.unmarkChunkComplete(chunk.id);
-            versoToast(`"${chunk.label}" marked as not done.`);
-            this.refreshAfterChunkUpdate();
+            versoConfirmUnmark(this.app, this.plugin, chunk, () => this.refreshAfterChunkUpdate());
           }
         });
       });
@@ -1602,6 +2313,11 @@ class VersoDashboardView extends ItemView {
         catchUp.setText(
           `${progress.missedDaysCount} missed ${dayWord} (${progress.missedPages} ${pageWord}) · ` +
           `${progress.paceNeeded} ${pacePageWord}/day to catch up`
+        );
+      } else if (progress.status === 'off-pace') {
+        const offPaceLine = card.createDiv({ cls: 'verso-progress-catchup' });
+        offPaceLine.setText(
+          `Target was ${this.formatDate(book.targetFinishDate)} · no schedule until a new date is set`
         );
       }
     });
@@ -1677,18 +2393,17 @@ class VersoDashboardView extends ItemView {
     const books = this.plugin.settings.books;
     const activeBooks = books.filter(b => b.status === 'active');
 
-    // Pages today — pages still REMAINING to read today: today's incomplete
-    // chunks belonging to active books only. Completed chunks drop out (so the
-    // count ticks down as readings are checked off via refreshAfterChunkUpdate),
-    // and non-active books (complete/planned/archived) never contribute — which
-    // keeps this in lockstep with the book cards below.
-    const today = versoToday();
+    // Pages today — pages still REMAINING to read today: today's actionable
+    // (upcoming) chunks belonging to active books only. Completed chunks drop
+    // out (so the count ticks down as readings are checked off via
+    // refreshAfterChunkUpdate), and non-active books (complete/planned/
+    // archived) never contribute — which keeps this in lockstep with the
+    // book cards below. Uses getTodaysChunks() rather than re-deriving the
+    // same filter inline — this used to duplicate it with a looser
+    // "!== 'complete'" check, which silently went stale once off-pace
+    // freezing meant a 'missed' chunk could also land on today's date.
     const activeIds = new Set(activeBooks.map(b => b.id));
-    const todaysChunks = this.plugin.settings.chunks.filter(c =>
-      c.scheduledDate === today &&
-      activeIds.has(c.bookId) &&
-      c.status !== 'complete'
-    );
+    const todaysChunks = this.plugin.getTodaysChunks();
     const pagesToday = todaysChunks.reduce((sum, c) => sum + (c.pagesEnd - c.pagesStart + 1), 0);
     const booksToday = new Set(todaysChunks.map(c => c.bookId)).size;
 
@@ -1697,14 +2412,14 @@ class VersoDashboardView extends ItemView {
     // before this check is even reached, so they're correctly excluded here
     // without any extra filtering.
     const onTrackCount = activeBooks.filter(b => {
-      const status = getBookStatus(b, this.plugin.settings.chunks);
+      const status = getBookStatus(b, this.plugin.settings.chunks, this.plugin.getReadingDaysFor(b));
       return status === 'on-track';
     }).length;
 
     // Books finished this year
     const currentYear = new Date().getFullYear();
     const booksFinishedThisYear = books.filter(b => {
-      if (b.status !== 'complete' || !b.dateCompleted) return false;
+      if (!versoIsFinishedBook(b) || !b.dateCompleted) return false;
       return new Date(b.dateCompleted).getFullYear() === currentYear;
     }).length;
 
@@ -1715,26 +2430,6 @@ class VersoDashboardView extends ItemView {
       onTrackCount,
       booksFinishedThisYear
     };
-  }
-
-  // Same vocabulary helpers as AddBookModal — collection term + singularization
-  getCollectionTerm() {
-    const term = this.plugin.settings.collectionTerm;
-    if (term === 'custom') {
-      return this.plugin.settings.collectionTermCustom || 'collection';
-    }
-    return term;
-  }
-
-  singularize(term) {
-    const map = {
-      classes: 'class',
-      projects: 'project',
-      subjects: 'subject',
-      lists: 'list',
-      shelves: 'shelf'
-    };
-    return map[term] || term;
   }
 }
 
@@ -1836,6 +2531,7 @@ class VersoTodaySidebarView extends ItemView {
 
       if (!interactive) return;
 
+      versoMakeCheckboxAccessible(checkbox, chunk.status === 'complete', `${book.title}, ${chunk.label}`);
       checkbox.addEventListener('click', async () => {
         if (chunk.status !== 'complete') {
           new VersoPagesReadModal(this.app, this.plugin, chunk, book, async (actualEnd) => {
@@ -1848,15 +2544,56 @@ class VersoTodaySidebarView extends ItemView {
             return { bookJustCompleted };
           }).open();
         } else {
-          await this.plugin.unmarkChunkComplete(chunk.id);
-          versoToast(`"${chunk.label}" marked as not done.`);
-          this.render();
-          this.plugin.refreshOpenDashboard();
+          versoConfirmUnmark(this.app, this.plugin, chunk, () => {
+            this.render();
+            this.plugin.refreshOpenDashboard();
+          });
         }
       });
     });
   }
 }
+
+
+// The round reading checkboxes are divs, so they need a role, a label, a
+// tab stop, and Enter/Space handling to work from the keyboard. (v1.3.2)
+function versoMakeCheckboxAccessible(el, checked, label) {
+  el.setAttribute('role', 'checkbox');
+  el.setAttribute('aria-checked', checked ? 'true' : 'false');
+  el.setAttribute('aria-label', label);
+  el.tabIndex = 0;
+  el.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      el.click();
+    }
+  });
+}
+
+// Unchecking a reading removes its logged pages, and on a finished book
+// reopens it, so it asks first. Shared by the dashboard and the sidebar.
+// (v1.3.2)
+function versoConfirmUnmark(app, plugin, chunk, onDone) {
+  const book = plugin.getBook(chunk.bookId);
+  let body = `"${chunk.label}" will go back to unread, and its pages will no longer count as read.`;
+  if (book && book.status === 'complete') {
+    body += ` "${book.title}" will no longer be marked finished.`;
+  }
+  new VersoConfirmModal(
+    app,
+    'Mark as not done?',
+    body,
+    'Mark as not done',
+    async () => {
+      await plugin.unmarkChunkComplete(chunk.id);
+      versoToast(`"${chunk.label}" marked as not done.`);
+      if (onDone) onDone();
+    }
+  ).open();
+}
+
+
+// ─── Book View ───────────────────────────────────────────────────────────────
 //
 // Per-book detail view, opened by clicking a book from the dashboard. Currently
 // minimal: header (title/author/cover), status + progress, schedule summary,
@@ -1995,6 +2732,11 @@ class VersoBookView extends ItemView {
           text: `${progress.missedDaysCount} missed ${dayWord} (${progress.missedPages} ${pageWord}) · ` +
             `${progress.paceNeeded} ${pacePageWord}/day to catch up`
         });
+      } else if (progress.status === 'off-pace') {
+        info.createDiv({
+          cls: 'verso-progress-catchup',
+          text: `Target was ${versoFormatDate(book.targetFinishDate)} · no schedule until a new date is set`
+        });
       }
     }
   }
@@ -2005,11 +2747,11 @@ class VersoBookView extends ItemView {
     const table = container.createDiv({ cls: 'verso-summary-table' });
 
     const collection = this.plugin.getCollection(book.collectionId);
-    const collectionTerm = this.getCollectionTerm();
-    this.addSummaryRow(table, this.capitalize(this.singularize(collectionTerm)), collection ? collection.name : '—');
-    this.addSummaryRow(table, 'Start date', versoFormatDate(book.startDate));
-    this.addSummaryRow(table, 'Finish by', versoFormatDate(book.targetFinishDate));
-    this.addSummaryRow(table, 'Reading days', this.describeReadingDays(book));
+    const collectionTerm = versoCollectionTerm(this.plugin.settings);
+    versoAddSummaryRow(table, versoCapitalize(versoCollectionTermSingular(this.plugin.settings)), collection ? collection.name : '—');
+    versoAddSummaryRow(table, 'Start date', versoFormatDate(book.startDate));
+    versoAddSummaryRow(table, 'Finish by', versoFormatDate(book.targetFinishDate));
+    versoAddSummaryRow(table, 'Reading days', this.describeReadingDays(book));
 
     this.renderActions(container, book);
   }
@@ -2020,14 +2762,14 @@ class VersoBookView extends ItemView {
     const table = container.createDiv({ cls: 'verso-summary-table' });
 
     const collection = this.plugin.getCollection(book.collectionId);
-    const collectionTerm = this.getCollectionTerm();
-    this.addSummaryRow(table, this.capitalize(this.singularize(collectionTerm)), collection ? collection.name : '—');
+    const collectionTerm = versoCollectionTerm(this.plugin.settings);
+    versoAddSummaryRow(table, versoCapitalize(versoCollectionTermSingular(this.plugin.settings)), collection ? collection.name : '—');
 
     const archivedOn = book.archivedDate
       ? new Date(book.archivedDate).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
       : '—';
-    this.addSummaryRow(table, 'Archived', archivedOn);
-    this.addSummaryRow(table, 'Reason', book.archiveReason || 'No reason given');
+    versoAddSummaryRow(table, 'Archived', archivedOn);
+    versoAddSummaryRow(table, 'Reason', book.archiveReason || 'No reason given');
 
     this.renderArchiveActions(container, book);
   }
@@ -2049,11 +2791,8 @@ class VersoBookView extends ItemView {
       text: 'Restore',
       cls: 'verso-btn verso-btn-secondary'
     });
-    restoreBtn.addEventListener('click', async () => {
-      await this.plugin.restoreBook(book.id);
-      await this.plugin.recalculateBook(book.id);
-      new Notice(`"${book.title}" restored.`);
-      this.render();
+    restoreBtn.addEventListener('click', () => {
+      versoRestoreBook(this.app, this.plugin, book, () => this.render());
     });
 
     const deleteBtn = actions.createEl('button', {
@@ -2079,13 +2818,16 @@ class VersoBookView extends ItemView {
   renderActions(container, book) {
     const actions = container.createDiv({ cls: 'verso-book-actions' });
 
-    if (book.status === 'active') {
-      const editScheduleBtn = actions.createEl('button', {
-        text: 'Edit schedule',
+    // Planned and active books can be edited. Completed books can't —
+    // editing total pages on a finished book is meaningless. Archived books
+    // have VersoArchiveModal in 'edit' mode for their reason instead.
+    if (book.status === 'active' || book.status === 'planned') {
+      const editBookBtn = actions.createEl('button', {
+        text: 'Edit book',
         cls: 'verso-btn verso-btn-secondary'
       });
-      editScheduleBtn.addEventListener('click', () => {
-        new VersoEditScheduleModal(this.app, this.plugin, book, () => {
+      editBookBtn.addEventListener('click', () => {
+        new VersoEditBookModal(this.app, this.plugin, book, () => {
           this.render();
         }).open();
       });
@@ -2098,18 +2840,26 @@ class VersoBookView extends ItemView {
     archiveBtn.addEventListener('click', () => {
       this.confirmArchive(book);
     });
+
+    // A planned book opened from the Library can be started from here too.
+    // (v1.3.2)
+    if (book.status === 'planned') {
+      const startBtn = actions.createEl('button', {
+        text: 'Start reading',
+        cls: 'verso-btn verso-btn-primary'
+      });
+      startBtn.addEventListener('click', () => {
+        new VersoActivateModal(this.app, this.plugin, book, () => {
+          this.render();
+        }).open();
+      });
+    }
   }
 
   confirmArchive(book) {
     new VersoArchiveModal(this.app, this.plugin, book, 'archive', () => {
       this.render();
     }).open();
-  }
-
-  addSummaryRow(table, label, value) {
-    const row = table.createDiv({ cls: 'verso-summary-row' });
-    row.createEl('span', { text: label, cls: 'verso-summary-label' });
-    row.createEl('span', { text: value, cls: 'verso-summary-value' });
   }
 
   describeReadingDays(book) {
@@ -2126,30 +2876,6 @@ class VersoBookView extends ItemView {
     }
     return 'Every day';
   }
-
-  capitalize(str) {
-    if (!str) return str;
-    return str.charAt(0).toUpperCase() + str.slice(1);
-  }
-
-  getCollectionTerm() {
-    const term = this.plugin.settings.collectionTerm;
-    if (term === 'custom') {
-      return this.plugin.settings.collectionTermCustom || 'collection';
-    }
-    return term;
-  }
-
-  singularize(term) {
-    const map = {
-      classes: 'class',
-      projects: 'project',
-      subjects: 'subject',
-      lists: 'list',
-      shelves: 'shelf'
-    };
-    return map[term] || term;
-  }
 }
 
 
@@ -2158,7 +2884,7 @@ class VersoBookView extends ItemView {
 // The book's permanent home — separate from the Dashboard's "what's due
 // today" focus. Three tabs:
 //   Planned   — books with no active schedule yet, waiting their turn
-//   Completed — books that have finished a reading assignment
+//   Completed — books the reader has read through to the end
 //   Archived  — books the reader stepped away from (restorable, deletable)
 //
 // Shell only for now: tab structure + basic lists. Reorder, the Activate
@@ -2349,7 +3075,11 @@ class VersoLibraryView extends ItemView {
     const list = container.createDiv({ cls: 'verso-library-list' });
 
     books.forEach(book => {
-      const row = list.createDiv({ cls: 'verso-library-row' });
+      // Opens the book view, like rows on the other tabs. (v1.3.2)
+      const row = list.createDiv({ cls: 'verso-library-row verso-library-row-clickable' });
+      row.addEventListener('click', () => {
+        this.plugin.activateBookView(book.id, 'library', this.activeTab);
+      });
 
       const cover = row.createDiv({ cls: 'verso-library-cover' });
       cover.style.backgroundColor = book.coverColor || '#B5D4F4';
@@ -2366,11 +3096,27 @@ class VersoLibraryView extends ItemView {
       info.createDiv({ text: meta.join(' · '), cls: 'verso-library-meta' });
 
       const actions = row.createDiv({ cls: 'verso-library-actions' });
+
+      // Secondary action first, primary last — same ordering as the
+      // Archived row (Restore + Delete).
+      const editBtn = actions.createEl('button', {
+        text: 'Edit',
+        cls: 'verso-btn verso-btn-secondary'
+      });
+      editBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        new VersoEditBookModal(this.app, this.plugin, book, () => {
+          this.render();
+          this.plugin.refreshOpenDashboard();
+        }).open();
+      });
+
       const activateBtn = actions.createEl('button', {
         text: 'Start reading',
         cls: 'verso-btn verso-btn-primary'
       });
-      activateBtn.addEventListener('click', () => {
+      activateBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
         new VersoActivateModal(this.app, this.plugin, book, () => {
           this.render();
           this.plugin.refreshOpenDashboard();
@@ -2473,12 +3219,9 @@ class VersoLibraryView extends ItemView {
         text: 'Restore',
         cls: 'verso-btn verso-btn-secondary'
       });
-      restoreBtn.addEventListener('click', async (e) => {
+      restoreBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        await this.plugin.restoreBook(book.id);
-        await this.plugin.recalculateBook(book.id);
-        new Notice(`"${book.title}" restored.`);
-        this.render();
+        versoRestoreBook(this.app, this.plugin, book, () => this.render());
       });
 
       const deleteBtn = actions.createEl('button', {
@@ -2727,6 +3470,8 @@ class VersoActivateModal extends Modal {
       this.updateConfirmButtonState();
     });
 
+    this.finishErrorEl = finishField.createDiv({ cls: 'verso-field-error' });
+
     if (this.book.targetFinishDate) {
       finishField.createEl('div', {
         cls: 'verso-field-desc',
@@ -2752,15 +3497,36 @@ class VersoActivateModal extends Modal {
     this.updateConfirmButtonState();
   }
 
+  // Checked in priority order: missing fields first, then the relative
+  // ordering of the dates, then the "not in the past" guard — Verso doesn't
+  // support backdating a book's schedule, so a finish date has to be today
+  // or later. (Start date can still be in the past here — activating a book
+  // you actually started a few days ago is fine; it's the FINISH commitment
+  // that can't already be broken the moment the schedule is built.)
+  validationError() {
+    if (!this.startDate || !this.targetFinishDate) return null;
+    if (this.targetFinishDate < this.startDate) {
+      return 'Finish date must be on or after the start date.';
+    }
+    if (this.targetFinishDate < versoToday()) {
+      return "Finish date can't be in the past.";
+    }
+    return null;
+  }
+
   isValid() {
-    return !!this.startDate && !!this.targetFinishDate && this.targetFinishDate >= this.startDate;
+    return !!this.startDate && !!this.targetFinishDate && !this.validationError();
   }
 
   updateConfirmButtonState() {
     if (!this.confirmBtn) return;
+    const error = this.validationError();
     const valid = this.isValid();
     this.confirmBtn.disabled = !valid;
     this.confirmBtn.toggleClass('verso-btn-disabled', !valid);
+    if (this.finishErrorEl) {
+      this.finishErrorEl.setText(error || '');
+    }
   }
 
   onClose() {
@@ -2769,26 +3535,145 @@ class VersoActivateModal extends Modal {
 }
 
 
-// ─── Edit Schedule Modal ────────────────────────────────────────────────────
+// ─── Restore ────────────────────────────────────────────────────────────────
 //
-// For an active book, lets the reader adjust its schedule: dates AND reading
-// days. Reading days had no edit path before this — the override set at
-// creation time (see AddBookModal) was permanent. This modal closes that gap.
-//  - No progress yet: startDate, targetFinishDate, AND reading days are all
-//    editable — this fully rebuilds the schedule (same as initial activation).
-//  - Progress exists: startDate is locked (a completed-chunk history can't
-//    sit "before" the book started), but targetFinishDate and reading days
-//    remain editable — recalculateSchedule() redistributes the remaining
-//    pages forward across whichever days are now selected.
+// Restoring an active book whose schedule had begun asks for a new finish
+// date first (v1.3.2). Previously the old plan kept running while the book
+// sat in the archive, so every reading day in that stretch came back as
+// missed and the book returned behind, at risk, or off pace.
+function versoRestoreBook(app, plugin, book, onDone) {
+  const finish = async (newTargetFinishDate) => {
+    await plugin.restoreBook(book.id, newTargetFinishDate);
+    new Notice(`"${book.title}" restored.`);
+    if (onDone) onDone();
+  };
+  if (plugin.restoreNeedsNewFinishDate(book)) {
+    new VersoRestoreModal(app, book, finish).open();
+  } else {
+    finish();
+  }
+}
 
-class VersoEditScheduleModal extends Modal {
+class VersoRestoreModal extends Modal {
+  constructor(app, book, onConfirm) {
+    super(app);
+    this.book = book;
+    this.onConfirm = onConfirm;
+    this.targetFinishDate = this.suggestedFinishDate();
+  }
+
+  // The old finish date pushed back by however long the book was archived,
+  // so the remaining pages keep roughly the pace they had. Never in the past.
+  suggestedFinishDate() {
+    const today = versoToday();
+    const old = this.book.targetFinishDate;
+    if (!old) return '';
+    let suggested = old;
+    if (this.book.archivedDate) {
+      const archived = versoParseLocalDate(versoLocalDateString(new Date(this.book.archivedDate)));
+      const daysArchived = Math.round((versoParseLocalDate(today) - archived) / 86400000);
+      if (daysArchived > 0) {
+        const shifted = versoParseLocalDate(old);
+        shifted.setDate(shifted.getDate() + daysArchived);
+        suggested = versoLocalDateString(shifted);
+      }
+    }
+    return suggested < today ? today : suggested;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass('verso-restore-modal');
+
+    contentEl.createEl('h3', { text: `Restore "${this.book.title}"` });
+    contentEl.createEl('p', {
+      text: 'Pick a new finish date. Verso will spread your remaining pages from today to that date. Days missed while the book was archived won\u2019t count against your pace.',
+      cls: 'verso-confirm-body'
+    });
+
+    const form = contentEl.createDiv({ cls: 'verso-form' });
+    const finishField = form.createDiv({ cls: 'verso-field' });
+    finishField.createEl('label', { text: 'Finish by', cls: 'verso-field-label' });
+    const finishInput = finishField.createEl('input', { type: 'date', cls: 'verso-input' });
+    finishInput.value = this.targetFinishDate;
+    finishInput.addEventListener('change', (e) => {
+      this.targetFinishDate = e.target.value;
+      this.updateConfirmButtonState();
+    });
+    this.finishErrorEl = finishField.createDiv({ cls: 'verso-field-error' });
+    if (this.book.targetFinishDate) {
+      finishField.createEl('div', {
+        cls: 'verso-field-desc',
+        text: `Your old finish date was ${versoFormatDate(this.book.targetFinishDate)}. The suggestion pushes it back by the time the book spent archived.`
+      });
+    }
+
+    const buttons = contentEl.createDiv({ cls: 'verso-confirm-buttons' });
+    const cancelBtn = buttons.createEl('button', { text: 'Cancel', cls: 'verso-btn verso-btn-text' });
+    cancelBtn.addEventListener('click', () => this.close());
+
+    this.confirmBtn = buttons.createEl('button', { text: 'Restore', cls: 'verso-btn verso-btn-primary' });
+    this.confirmBtn.addEventListener('click', async () => {
+      if (this.submitted || !this.isValid()) return;
+      this.submitted = true;
+      this.confirmBtn.disabled = true;
+      const date = this.targetFinishDate;
+      this.close();
+      await this.onConfirm(date);
+    });
+
+    this.updateConfirmButtonState();
+  }
+
+  validationError() {
+    if (!this.targetFinishDate) return null;
+    if (this.targetFinishDate < versoToday()) return "Finish date can't be in the past.";
+    return null;
+  }
+
+  isValid() {
+    return !!this.targetFinishDate && !this.validationError();
+  }
+
+  updateConfirmButtonState() {
+    if (!this.confirmBtn) return;
+    const valid = this.isValid();
+    this.confirmBtn.disabled = !valid;
+    this.confirmBtn.toggleClass('verso-btn-disabled', !valid);
+    if (this.finishErrorEl) this.finishErrorEl.setText(this.validationError() || '');
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+
+// ─── Edit Book Modal ────────────────────────────────────────────────────────
+//
+// Edits a book's info (title, author, cover color, total pages, collection)
+// and, where it has one, its schedule. Renders by status:
+//  - Planned: book info, target finish date, and reading days. No start date —
+//    a planned book doesn't have one until VersoActivateModal sets it. Every
+//    field here is consequence-free; no chunks exist to disturb.
+//  - Active, no progress yet: startDate, targetFinishDate, AND reading days
+//    are all editable — this fully rebuilds the schedule.
+//  - Active, progress exists: startDate is locked (a completed-chunk history
+//    can't sit "before" the book started), but targetFinishDate and reading
+//    days remain editable — recalculateSchedule() redistributes the remaining
+//    pages forward across whichever days are now selected.
+//
+// Completed and archived books have no edit path here by design.
+
+class VersoEditBookModal extends Modal {
   constructor(app, plugin, book, onUpdated) {
     super(app);
     this.plugin = plugin;
     this.book = book;
     this.onUpdated = onUpdated || null;
 
-    this.timelineStarted = book.startDate < versoToday();
+    this.timelineStarted = plugin.hasBookStarted(book);
 
     this.startDate = book.startDate || versoToday();
     this.targetFinishDate = book.targetFinishDate || '';
@@ -2806,6 +3691,23 @@ class VersoEditScheduleModal extends Modal {
     this.customReadingDays = book.readingDaysOverride
       ? { ...book.readingDaysOverride }
       : globalReadingDaysAsObject(this.plugin.settings);
+
+    // ── Book info state ─────────────────────────────────────────
+    this.title = book.title;
+    this.author = book.author || '';
+    this.coverColor = book.coverColor || '#B5D4F4';
+    this.totalPages = book.totalPages;
+    // 'page' or 'percent' — see progressInputMode on the book. Allowed to
+    // flip mid-book (e.g. switching from print to Kindle); already-logged
+    // chunks keep their stored page numbers regardless of mode.
+    // (LiveAQuietLife, 2026-09-04)
+    this.progressInputMode = book.progressInputMode || 'page';
+
+    // A planned book has no start date yet — it's set when the book is
+    // activated (VersoActivateModal). Schedule editing here is limited to
+    // the target finish date and reading days: every field a planned book
+    // can touch is consequence-free, since no chunks exist to disturb.
+    this.isPlanned = book.status === 'planned';
   }
 
   onOpen() {
@@ -2813,37 +3715,211 @@ class VersoEditScheduleModal extends Modal {
     contentEl.empty();
     contentEl.addClass('verso-activate-modal');
 
-    contentEl.createEl('h3', { text: `Edit schedule for "${this.book.title}"` });
-    contentEl.createEl('p', {
-      text: this.timelineStarted
-        ? "Verso will redistribute your remaining pages across the new dates and reading days."
-        : "Verso will rebuild your daily reading schedule using these dates and reading days.",
-      cls: 'verso-confirm-body'
-    });
+    contentEl.createEl('h3', { text: `Edit "${this.book.title}"` });
 
     const form = contentEl.createDiv({ cls: 'verso-form' });
 
-    // ── Start date ───────────────────────────────────────────────
-    const startField = form.createDiv({ cls: 'verso-field' });
-    startField.createEl('label', { text: 'Start date', cls: 'verso-field-label' });
-    const startInput = startField.createEl('input', {
-      type: 'date',
+    // ── Book info ────────────────────────────────────────────────
+    // Field scope locked 2026-07-26: title, author, cover color,
+    // total pages, plus the collection picker (metadata, not schedule —
+    // it lives here rather than under Schedule below). isbn / publisher /
+    // year / notes stay out — they're scaffolding for Book Search and
+    // building edit UI for fields nothing displays yet is wasted work.
+    form.createDiv({ cls: 'verso-section-label', text: 'BOOK INFO' });
+
+    const titleField = form.createDiv({ cls: 'verso-field' });
+    titleField.createEl('label', { text: 'Title', cls: 'verso-field-label' });
+    const titleInput = titleField.createEl('input', {
+      type: 'text',
       cls: 'verso-input'
     });
-    startInput.value = this.startDate;
+    titleInput.value = this.title;
+    titleInput.addEventListener('input', (e) => {
+      this.title = e.target.value;
+      this.updateConfirmButtonState();
+    });
+    // Applied on blur, not per-keystroke — live title-casing fights the
+    // cursor mid-word. (LiveAQuietLife, 2026-09-05)
+    titleInput.addEventListener('blur', (e) => {
+      this.title = versoTitleCase(e.target.value);
+      e.target.value = this.title;
+    });
+    this.titleErrorEl = titleField.createDiv({ cls: 'verso-field-error' });
 
-    if (this.timelineStarted) {
-      startInput.disabled = true;
-      startInput.title = 'Locked — this book\'s reading schedule has already begun.';
-      startField.createEl('div', {
-        cls: 'verso-field-desc',
-        text: "Locked — this book's reading schedule has already begun, so the start date can't change."
+    const authorField = form.createDiv({ cls: 'verso-field' });
+    authorField.createEl('label', { text: 'Author', cls: 'verso-field-label' });
+    const authorInput = authorField.createEl('input', {
+      type: 'text',
+      cls: 'verso-input'
+    });
+    authorInput.value = this.author;
+    authorInput.addEventListener('input', (e) => {
+      this.author = e.target.value;
+    });
+    authorInput.addEventListener('blur', (e) => {
+      this.author = versoNameCase(e.target.value);
+      e.target.value = this.author;
+    });
+
+    const colorField = form.createDiv({ cls: 'verso-field verso-field-color' });
+    colorField.createEl('label', { text: 'Cover color', cls: 'verso-field-label' });
+
+    const swatchRow = colorField.createDiv({ cls: 'verso-color-swatch-row' });
+    COVER_COLORS.forEach(color => {
+      const swatch = swatchRow.createDiv({ cls: 'verso-color-swatch' });
+      swatch.style.backgroundColor = color;
+      if (color === this.coverColor) swatch.addClass('verso-color-swatch-selected');
+
+      swatch.addEventListener('click', () => {
+        this.coverColor = color;
+        swatchRow.querySelectorAll('.verso-color-swatch').forEach(s =>
+          s.removeClass('verso-color-swatch-selected')
+        );
+        swatch.addClass('verso-color-swatch-selected');
       });
-    } else {
-      startInput.addEventListener('change', (e) => {
-        this.startDate = e.target.value;
-        this.updateConfirmButtonState();
+    });
+
+    const pagesField = form.createDiv({ cls: 'verso-field' });
+    pagesField.createEl('label', { text: 'Total pages', cls: 'verso-field-label' });
+    const pagesInput = pagesField.createEl('input', {
+      type: 'number',
+      cls: 'verso-input',
+      attr: { min: '1' }
+    });
+    pagesInput.value = this.totalPages;
+    pagesInput.addEventListener('input', (e) => {
+      const value = parseInt(e.target.value, 10);
+      this.totalPages = isNaN(value) ? null : value;
+      this.updateConfirmButtonState();
+    });
+    this.pagesErrorEl = pagesField.createDiv({ cls: 'verso-field-error' });
+
+    // ── Percent-based progress (e-readers) ────────────────────────
+    const percentModeField = form.createDiv({ cls: 'verso-field verso-field-toggle' });
+    const percentModeLabel = percentModeField.createEl('label', { cls: 'verso-toggle-label' });
+    const percentModeCheckbox = percentModeLabel.createEl('input', {
+      type: 'checkbox',
+      cls: 'verso-checkbox'
+    });
+    percentModeCheckbox.checked = this.progressInputMode === 'percent';
+    percentModeLabel.createSpan({ text: 'Track progress by percentage instead of page number' });
+    percentModeCheckbox.addEventListener('change', (e) => {
+      this.progressInputMode = e.target.checked ? 'percent' : 'page';
+    });
+    // See AddBookModal's identical toggle for why this is a sibling, not a
+    // nested child, of percentModeField. (LiveAQuietLife, 2026-09-05)
+    form.createEl('div', {
+      cls: 'verso-field-desc',
+      text: "For e-readers (Kindle, Kobo, etc.) that only show a percent, not a page number."
+    });
+
+    // ── Collection picker ────────────────────────────────────────
+    // Shelf reassignment is metadata-only — changing a book's collection
+    // does not affect its schedule in any way. A "— No shelf —" option is
+    // always present so a book can stay (or be moved) outside any collection
+    // without silently force-assigning it when the modal opens.
+    const collectionTerm = versoCollectionTerm(this.plugin.settings);
+    const singularTerm = versoCollectionTermSingular(this.plugin.settings);
+    const collections = this.plugin.settings.collections;
+
+    const collField = form.createDiv({ cls: 'verso-field' });
+    collField.createEl('label', {
+      text: versoCapitalize(singularTerm),
+      cls: 'verso-field-label'
+    });
+
+    const collSelect = collField.createEl('select', { cls: 'verso-input' });
+
+    const noneOpt = collSelect.createEl('option', {
+      text: `\u2014 No ${singularTerm} \u2014`,
+      value: '__none__'
+    });
+
+    collections.forEach(c => {
+      const opt = collSelect.createEl('option', { text: c.name, value: c.id });
+      if (this.book.collectionId === c.id) opt.selected = true;
+    });
+
+    collSelect.createEl('option', {
+      text: `+ New ${singularTerm}`,
+      value: '__new__'
+    });
+
+    if (!this.book.collectionId) {
+      noneOpt.selected = true;
+    }
+
+    const newCollField = form.createDiv({ cls: 'verso-field verso-field-indent' });
+    newCollField.createEl('label', {
+      text: `New ${singularTerm} name`,
+      cls: 'verso-field-label'
+    });
+    const newCollInput = newCollField.createEl('input', {
+      type: 'text',
+      cls: 'verso-input',
+      attr: { placeholder: `e.g. ${versoExampleCollectionName(collectionTerm)}` }
+    });
+    newCollInput.value = this.newCollectionName;
+    newCollInput.addEventListener('input', e => {
+      this.newCollectionName = e.target.value;
+      this.updateConfirmButtonState();
+    });
+
+    const updateCollectionSelection = () => {
+      const val = collSelect.value;
+      if (val === '__new__') {
+        this.isCreatingNewCollection = true;
+        this.selectedCollectionId = null;
+        newCollField.style.display = 'flex';
+        newCollInput.focus();
+      } else {
+        this.isCreatingNewCollection = false;
+        this.selectedCollectionId = val === '__none__' ? null : val;
+        newCollField.style.display = 'none';
+      }
+      this.updateConfirmButtonState();
+    };
+
+    collSelect.addEventListener('change', updateCollectionSelection);
+    newCollField.style.display = 'none';
+
+    // ── Schedule ─────────────────────────────────────────────────
+    form.createDiv({ cls: 'verso-section-label verso-section-label-spaced', text: 'SCHEDULE' });
+    form.createEl('p', {
+      text: this.isPlanned
+        ? "This book hasn't started yet — set a target date and reading days for when you begin."
+        : this.timelineStarted
+          ? "Verso will redistribute your remaining pages across the new dates and reading days."
+          : "Verso will rebuild your daily reading schedule using these dates and reading days.",
+      cls: 'verso-confirm-body'
+    });
+
+    // ── Start date ───────────────────────────────────────────────
+    // Planned books don't have one yet — it's set on activation, not here.
+    if (!this.isPlanned) {
+      const startField = form.createDiv({ cls: 'verso-field' });
+      startField.createEl('label', { text: 'Start date', cls: 'verso-field-label' });
+      const startInput = startField.createEl('input', {
+        type: 'date',
+        cls: 'verso-input'
       });
+      startInput.value = this.startDate;
+      this.startErrorEl = null;
+
+      if (this.timelineStarted) {
+        startInput.disabled = true;
+        startInput.title = 'Locked — this book\'s reading schedule has already begun.';
+        startField.createEl('div', {
+          cls: 'verso-field-desc',
+          text: "Locked — this book's reading schedule has already begun, so the start date can't change."
+        });
+      } else {
+        startInput.addEventListener('change', (e) => {
+          this.startDate = e.target.value;
+          this.updateConfirmButtonState();
+        });
+        this.startErrorEl = startField.createDiv({ cls: 'verso-field-error' });
+      }
     }
 
     // ── Finish date ──────────────────────────────────────────────
@@ -2907,76 +3983,6 @@ class VersoEditScheduleModal extends Modal {
       this.updateConfirmButtonState();
     });
 
-    // ── Collection picker ────────────────────────────────────────
-    // Shelf reassignment is metadata-only — changing a book's collection
-    // does not affect its schedule in any way. A "— No shelf —" option is
-    // always present so a book can stay (or be moved) outside any collection
-    // without silently force-assigning it when the modal opens.
-    const collectionTerm = this.getCollectionTerm();
-    const singularTerm = this.singularize(collectionTerm);
-    const collections = this.plugin.settings.collections;
-
-    const collField = form.createDiv({ cls: 'verso-field' });
-    collField.createEl('label', {
-      text: this.capitalize(singularTerm),
-      cls: 'verso-field-label'
-    });
-
-    const collSelect = collField.createEl('select', { cls: 'verso-input' });
-
-    const noneOpt = collSelect.createEl('option', {
-      text: `\u2014 No ${singularTerm} \u2014`,
-      value: '__none__'
-    });
-
-    collections.forEach(c => {
-      const opt = collSelect.createEl('option', { text: c.name, value: c.id });
-      if (this.book.collectionId === c.id) opt.selected = true;
-    });
-
-    collSelect.createEl('option', {
-      text: `+ New ${singularTerm}`,
-      value: '__new__'
-    });
-
-    if (!this.book.collectionId) {
-      noneOpt.selected = true;
-    }
-
-    const newCollField = form.createDiv({ cls: 'verso-field verso-field-indent' });
-    newCollField.createEl('label', {
-      text: `New ${singularTerm} name`,
-      cls: 'verso-field-label'
-    });
-    const newCollInput = newCollField.createEl('input', {
-      type: 'text',
-      cls: 'verso-input',
-      attr: { placeholder: `e.g. ${this.exampleCollectionName(collectionTerm)}` }
-    });
-    newCollInput.value = this.newCollectionName;
-    newCollInput.addEventListener('input', e => {
-      this.newCollectionName = e.target.value;
-      this.updateConfirmButtonState();
-    });
-
-    const updateCollectionSelection = () => {
-      const val = collSelect.value;
-      if (val === '__new__') {
-        this.isCreatingNewCollection = true;
-        this.selectedCollectionId = null;
-        newCollField.style.display = 'flex';
-        newCollInput.focus();
-      } else {
-        this.isCreatingNewCollection = false;
-        this.selectedCollectionId = val === '__none__' ? null : val;
-        newCollField.style.display = 'none';
-      }
-      this.updateConfirmButtonState();
-    };
-
-    collSelect.addEventListener('change', updateCollectionSelection);
-    newCollField.style.display = 'none';
-
     // ── Buttons ──────────────────────────────────────────────────
     const buttons = contentEl.createDiv({ cls: 'verso-confirm-buttons' });
 
@@ -2987,9 +3993,44 @@ class VersoEditScheduleModal extends Modal {
     this.confirmBtn.addEventListener('click', async () => {
       if (!this.isValid()) return;
 
-      if (this.targetFinishDate === versoToday()) {
-        const progress = this.plugin.getBookProgress(this.book.id);
-        const remainingPages = progress ? progress.totalPages - progress.pagesRead : this.book.totalPages;
+      const progress = this.plugin.getBookProgress(this.book.id);
+      const pagesRead = progress ? progress.pagesRead : 0;
+      const remainingPages = Math.max(0, this.totalPages - pagesRead);
+
+      // ── Completion case ──────────────────────────────────────────
+      // Lowering total pages to exactly what's been read leaves nothing to
+      // schedule. Doing nothing here would strand the book: recalculate
+      // produces zero chunks, and completion only ever fires on chunk
+      // completion, so it would sit at 100% on the dashboard forever,
+      // unable to finish. Checked BEFORE the finish-today branch below,
+      // which would otherwise offer to compress zero pages into a chunk.
+      //
+      // Confirmation is the only guard on this — completing prunes the
+      // book's remaining chunks, and typing the old number back afterwards
+      // will not bring them back. So the dialog says so plainly.
+      if (this.isCompletionEdit()) {
+        this.close();
+        new VersoConfirmModal(
+          this.app,
+          'Mark this book complete?',
+          `${this.totalPages} pages, and you've read all of them. Verso will mark "${this.book.title}" complete and clear its remaining schedule. This can't be undone from here.`,
+          'Mark complete',
+          async () => {
+            await this.saveChanges();
+          }
+        ).open();
+        return;
+      }
+
+      // Only when the finish date is being MOVED to today. A book already
+      // due today used to show this on every save, even a title edit.
+      // Planned books have no schedule to compress. (v1.3.2)
+      if (!this.isPlanned &&
+          this.targetFinishDate === versoToday() &&
+          this.targetFinishDate !== (this.book.targetFinishDate || '')) {
+        // Use the pending page count, not the saved one — if the reader just
+        // corrected total pages in this same form, the old number would
+        // describe a book that's about to stop existing.
         const pageWord = remainingPages === 1 ? 'page' : 'pages';
         this.close();
         new VersoConfirmModal(
@@ -2998,23 +4039,69 @@ class VersoEditScheduleModal extends Modal {
           `This will compress your remaining ${remainingPages} ${pageWord} into a single chunk due today. Are you sure?`,
           'Save changes',
           async () => {
-            await this.saveSchedule();
+            await this.saveChanges();
           }
         ).open();
         return;
       }
 
       this.close();
-      await this.saveSchedule();
+      await this.saveChanges();
     });
 
     this.updateConfirmButtonState();
   }
 
-  async saveSchedule() {
+  // True when saving would leave this book with nothing left to read.
+  // Only meaningful for active books: a planned book has no logged pages,
+  // and completed books have no edit path at all.
+  isCompletionEdit() {
+    if (this.book.status !== 'active') return false;
+    if (this.totalPages === null || this.totalPages === undefined) return false;
+    const progress = this.plugin.getBookProgress(this.book.id);
+    const pagesRead = progress ? progress.pagesRead : 0;
+    // pagesRead can only ever equal totalPages here, not exceed it —
+    // validationError() blocks anything lower before we get this far.
+    return pagesRead > 0 && this.totalPages <= pagesRead;
+  }
+
+  // Save order matters: book info goes first so that a changed totalPages is
+  // already persisted before updateBookDates() rebuilds or recalculates the
+  // schedule. That internal rebuild is the only recalculation needed — calling
+  // recalculateBook() again here would just redo work that already happened
+  // against the correct page count.
+  async saveChanges() {
     const readingDaysOverride = this.overrideReadingDays
       ? { ...this.customReadingDays }
       : null;
+
+    // Determine this BEFORE writing anything: once the new totalPages is
+    // persisted, isCompletionEdit() would be reading the post-save state.
+    const completesBook = this.isCompletionEdit();
+
+    // ── Book info ────────────────────────────────────────────────
+    const trimmedTitle = this.title.trim();
+    const trimmedAuthor = this.author.trim();
+
+    const infoUpdates = {};
+    if (trimmedTitle !== this.book.title) infoUpdates.title = trimmedTitle;
+    if (trimmedAuthor !== (this.book.author || '')) infoUpdates.author = trimmedAuthor;
+    if (this.coverColor !== (this.book.coverColor || '#B5D4F4')) infoUpdates.coverColor = this.coverColor;
+    if (this.totalPages !== this.book.totalPages) infoUpdates.totalPages = this.totalPages;
+    if (this.progressInputMode !== (this.book.progressInputMode || 'page')) {
+      infoUpdates.progressInputMode = this.progressInputMode;
+    }
+
+    const infoChanged = Object.keys(infoUpdates).length > 0;
+    if (infoChanged) {
+      await this.plugin.updateBook(this.book.id, infoUpdates);
+    }
+    // Chunk labels are stored, and depend on the mode (pages or percent)
+    // and, in percent mode, on the page count. They used to keep the old
+    // form until a restart. (v1.3.2)
+    if ('progressInputMode' in infoUpdates || 'totalPages' in infoUpdates) {
+      await this.plugin.relabelChunks(this.book.id);
+    }
 
     // ── Collection reassignment ──────────────────────────────────
     // Purely a metadata update — no schedule recalculation needed.
@@ -3030,7 +4117,9 @@ class VersoEditScheduleModal extends Modal {
     }
 
     const oldCollectionId = this.book.collectionId;
-    if (oldCollectionId !== newCollectionId) {
+    const collectionChanged = oldCollectionId !== newCollectionId;
+
+    if (collectionChanged) {
       if (oldCollectionId) {
         const oldColl = this.plugin.getCollection(oldCollectionId);
         if (oldColl) {
@@ -3050,8 +4139,49 @@ class VersoEditScheduleModal extends Modal {
       await this.plugin.updateBook(this.book.id, { collectionId: newCollectionId });
     }
 
-    await this.plugin.updateBookDates(this.book.id, this.startDate, this.targetFinishDate, readingDaysOverride);
-    new Notice(`Schedule updated for "${this.book.title}".`);
+    // ── Completion, or schedule ──────────────────────────────────
+    // These are mutually exclusive. If the edit zeroed out the remaining
+    // pages there is no schedule to rebuild — updateBookDates() would
+    // generate zero chunks and leave the book stranded at 100% and active.
+    // Complete it instead, dated when the reading actually ended rather
+    // than when the correction was typed.
+    const title = trimmedTitle || this.book.title;
+
+    if (completesBook) {
+      const completionDate =
+        this.plugin.lastChunkCompletionDate(this.book.id) || new Date().toISOString();
+      await this.plugin.checkBookCompletion(this.book.id, completionDate);
+
+      // Quiet by design. The celebration modal belongs to the moment a
+      // reader finishes their last chunk; firing it from a correction form
+      // would be performing at someone doing bookkeeping.
+      new Notice(`"${title}" is complete.`);
+      this.plugin.refreshAllViews();
+      if (this.onUpdated) this.onUpdated();
+      return;
+    }
+
+    // ── Schedule ─────────────────────────────────────────────────
+    // updateBookDates() handles the planned / not-yet-begun / begun cases
+    // itself, including refusing to build chunks for a planned book.
+    // updateBook() replaces the stored object, so this.book still holds
+    // the values from before this save.
+    const scheduleChanged = this.scheduleFieldsChanged();
+
+    if (scheduleChanged) {
+      await this.plugin.updateBookDates(this.book.id, this.startDate, this.targetFinishDate, readingDaysOverride);
+    }
+
+    // ── Notice ───────────────────────────────────────────────────
+    // Say only what actually happened. A title correction shouldn't claim
+    // the schedule changed, and nothing at all shouldn't claim anything.
+    if (scheduleChanged && !infoChanged && !collectionChanged) {
+      new Notice(`Schedule updated for "${title}".`);
+    } else if (infoChanged || collectionChanged || scheduleChanged) {
+      new Notice(`"${title}" updated.`);
+    }
+
+    this.plugin.refreshAllViews();
     if (this.onUpdated) this.onUpdated();
   }
 
@@ -3059,22 +4189,98 @@ class VersoEditScheduleModal extends Modal {
     return !this.validationError();
   }
 
-  // Returns a user-facing message if the current dates are invalid, or null
-  // if they're fine. Checked in priority order: missing fields first, then
-  // the relative ordering of the dates, then the "not in the past" guard —
-  // a finish date can't be earlier than the start date OR earlier than today.
+  // Returns { message, field } if something is invalid, or null if everything
+  // is fine. `field` tells updateConfirmButtonState() which inline error slot
+  // to write into, so a title problem doesn't surface under the finish date.
+  // Checked in priority order: book info first, then collection, then the
+  // dates (missing fields, relative ordering, then the "not in the past"
+  // guard — a finish date can't be earlier than the start date OR today).
   validationError() {
+    if (!this.title.trim()) {
+      return { message: 'A book needs a title.', field: 'title' };
+    }
+
+    // ── Total pages, three tiers ─────────────────────────────────
+    // Lowering the total below what's already logged is blocked outright,
+    // not warned about: warn-and-allow would let a typo produce a book
+    // sitting at 118% progress with an input.max below its own history.
+    // Setting it EQUAL to pages read is deliberately allowed here — that's
+    // the completion path, handled at save time, not a validation error.
+    if (this.totalPages === null || this.totalPages === undefined) {
+      return { message: 'Total pages is required.', field: 'pages' };
+    }
+    if (this.totalPages < 1) {
+      return { message: 'A book needs at least one page.', field: 'pages' };
+    }
+
+    // Read live rather than caching at open time — cheap, and removes any
+    // question about staleness if pages get logged while the modal is open.
+    const progress = this.plugin.getBookProgress(this.book.id);
+    const pagesRead = progress ? progress.pagesRead : 0;
+    if (this.totalPages < pagesRead) {
+      const pageWord = pagesRead === 1 ? 'page' : 'pages';
+      return {
+        message: `You've already logged ${pagesRead} ${pageWord}. Total pages can't be lower than that.`,
+        field: 'pages'
+      };
+    }
+
     if (this.isCreatingNewCollection && !this.newCollectionName.trim()) {
-      return `Enter a name for the new ${this.singularize(this.getCollectionTerm())}.`;
+      return {
+        message: `Enter a name for the new ${versoCollectionTermSingular(this.plugin.settings)}.`,
+        field: 'finish'
+      };
     }
-    if (!this.startDate || !this.targetFinishDate) return null;
-    if (this.targetFinishDate < this.startDate) {
-      return 'Finish date must be on or after the start date.';
+    // A planned book's due date is optional. An active book needs both
+    // dates: saving without one used to wipe its whole schedule. (v1.3.2)
+    if (this.isPlanned && !this.targetFinishDate) return null;
+    if (!this.isPlanned && !this.startDate) {
+      return { message: 'Choose a start date.', field: 'start' };
     }
+    if (!this.targetFinishDate) {
+      return { message: 'Choose a finish date.', field: 'finish' };
+    }
+    // A planned book shows no start date field, so an error mentioning one
+    // would point at something the reader can't see. Only the "not in the
+    // past" rule applies there.
+    if (!this.isPlanned) {
+      if (this.targetFinishDate < this.startDate) {
+        return { message: 'Finish date must be on or after the start date.', field: 'finish' };
+      }
+    }
+    // An off-pace book's finish date is already in the past. Keeping it is
+    // fine for an edit that leaves the schedule alone (title, author,
+    // color, collection). Changing the date, reading days, or page count
+    // needs a new finish date. (v1.3.2)
     if (this.targetFinishDate < versoToday()) {
-      return "Finish date can't be in the past.";
+      const keptOldDate = this.targetFinishDate === (this.book.targetFinishDate || '');
+      if (!keptOldDate) {
+        return { message: "Finish date can't be in the past.", field: 'finish' };
+      }
+      if (this.scheduleFieldsChanged()) {
+        return { message: 'Choose a new finish date to change the schedule.', field: 'finish' };
+      }
     }
     return null;
+  }
+
+  // True when the edit touches anything the schedule is built from:
+  // start date, finish date, reading days, or total pages.
+  scheduleFieldsChanged() {
+    const readingDaysOverride = this.overrideReadingDays ? { ...this.customReadingDays } : null;
+    const readingDaysChanged =
+      JSON.stringify(readingDaysOverride) !== JSON.stringify(this.book.readingDaysOverride || null);
+    // A planned book has no startDate — this.startDate holds a today default
+    // that's never shown and never saved (updateBookDates ignores it for
+    // planned books). Comparing it against the book's null would report a
+    // change on every open, so it's excluded from detection entirely.
+    const startDateChanged = !this.isPlanned && this.startDate !== this.book.startDate;
+    return startDateChanged ||
+      this.targetFinishDate !== (this.book.targetFinishDate || '') ||
+      readingDaysChanged ||
+      // A changed page count means the schedule has to be rebuilt even if
+      // no date moved — the pages no longer divide the same way.
+      this.totalPages !== this.book.totalPages;
   }
 
   updateConfirmButtonState() {
@@ -3083,48 +4289,23 @@ class VersoEditScheduleModal extends Modal {
     const valid = !error;
     this.confirmBtn.disabled = !valid;
     this.confirmBtn.toggleClass('verso-btn-disabled', !valid);
+
+    if (this.titleErrorEl) {
+      this.titleErrorEl.setText(error && error.field === 'title' ? error.message : '');
+    }
+    if (this.pagesErrorEl) {
+      this.pagesErrorEl.setText(error && error.field === 'pages' ? error.message : '');
+    }
     if (this.finishErrorEl) {
-      this.finishErrorEl.setText(error || '');
+      this.finishErrorEl.setText(error && error.field === 'finish' ? error.message : '');
+    }
+    if (this.startErrorEl) {
+      this.startErrorEl.setText(error && error.field === 'start' ? error.message : '');
     }
   }
 
   onClose() {
     this.contentEl.empty();
-  }
-
-  getCollectionTerm() {
-    const term = this.plugin.settings.collectionTerm;
-    if (term === 'custom') {
-      return this.plugin.settings.collectionTermCustom || 'collection';
-    }
-    return term;
-  }
-
-  capitalize(str) {
-    if (!str) return str;
-    return str.charAt(0).toUpperCase() + str.slice(1);
-  }
-
-  singularize(term) {
-    const map = {
-      classes: 'class',
-      projects: 'project',
-      subjects: 'subject',
-      lists: 'list',
-      shelves: 'shelf'
-    };
-    return map[term] || term;
-  }
-
-  exampleCollectionName(term) {
-    const examples = {
-      classes: 'OT Survey',
-      projects: 'Summer reading',
-      subjects: 'Bible',
-      lists: 'To read',
-      shelves: 'Currently reading'
-    };
-    return examples[term] || 'New collection';
   }
 }
 
@@ -3148,7 +4329,20 @@ class VersoPagesReadModal extends Modal {
     this.onConfirm = onConfirm || null;
 
     this.scheduledEnd = chunk.pagesEnd;
-    this.actualEnd = chunk.pagesEnd; // pre-fill with the plan
+    this.actualEnd = chunk.pagesEnd; // pre-fill with the plan — stays the
+    // page-number source of truth throughout, in both modes. Percent mode
+    // (below) only changes what the reader types; every existing consumer
+    // of actualEnd (isValid, onConfirm, fireMessage) is untouched.
+
+    // Percent-mode pre-fill, kept as its own field so the input can show a
+    // whole percent without fighting rounding against actualEnd on every
+    // keystroke. Recomputed from actualEnd whenever the percent input
+    // changes; actualEnd is recomputed from it in the other direction.
+    // (LiveAQuietLife, 2026-09-04)
+    this.isPercentMode = book && book.progressInputMode === 'percent' && book.totalPages > 0;
+    this.actualPercent = this.isPercentMode
+      ? Math.round((chunk.pagesEnd / book.totalPages) * 100)
+      : null;
   }
 
   onOpen() {
@@ -3160,28 +4354,66 @@ class VersoPagesReadModal extends Modal {
 
     const desc = contentEl.createEl('p', { cls: 'verso-confirm-body' });
     desc.createSpan({ text: "Today's reading: " });
-    desc.createEl('strong', { text: buildChunkLabel(this.chunk.pagesStart, this.chunk.pagesEnd) });
+    // Percent mode shows start → target (e.g. "20% → 23%"), so the reader
+    // can see where today's reading begins as well as where it ends — the
+    // lowest percent the input accepts is the start. (v1.3.2)
+    let chunkText = buildChunkLabel(this.chunk.pagesStart, this.chunk.pagesEnd, this.book);
+    if (this.isPercentMode) {
+      const startPct = this.pageToPercent(this.chunk.pagesStart);
+      const endPct = this.pageToPercent(this.chunk.pagesEnd);
+      if (startPct < endPct) chunkText = `${startPct}% → ${endPct}%`;
+    }
+    desc.createEl('strong', { text: chunkText });
     desc.createSpan({ text: this.book && this.book.title ? ` of ${this.book.title}.` : '.' });
 
     const form = contentEl.createDiv({ cls: 'verso-form' });
 
     const field = form.createDiv({ cls: 'verso-field' });
-    field.createEl('label', { text: 'You read to page', cls: 'verso-field-label' });
 
-    const input = field.createEl('input', { type: 'number', cls: 'verso-input' });
-    input.value = String(this.actualEnd);
-    input.min = String(this.chunk.pagesStart);
-    input.max = String(this.book.totalPages);
-    input.addEventListener('input', (e) => {
-      const raw = e.target.value;
-      this.actualEnd = raw === '' ? null : parseInt(raw, 10);
-      this.updateConfirmButtonState();
-    });
+    if (this.isPercentMode) {
+      // Percent mode: the reader types the percent their e-reader shows;
+      // this converts to a page number under the hood so every downstream
+      // consumer (isValid, onConfirm, markChunkComplete) keeps working in
+      // pages, unchanged. (LiveAQuietLife, 2026-09-04)
+      field.createEl('label', { text: "You've read up to", cls: 'verso-field-label' });
 
-    field.createEl('div', {
-      cls: 'verso-field-desc',
-      text: 'Pre-filled with where you were headed. Adjust it to match where you actually landed.'
-    });
+      const percentInput = field.createEl('input', { type: 'number', cls: 'verso-input' });
+      percentInput.value = String(this.actualPercent);
+      percentInput.min = '0';
+      percentInput.max = '100';
+      percentInput.addEventListener('input', (e) => {
+        const raw = e.target.value;
+        this.actualPercent = raw === '' ? null : parseInt(raw, 10);
+        this.actualEnd = this.percentToPage(this.actualPercent);
+        this.updateConfirmButtonState();
+      });
+
+      field.createEl('div', {
+        cls: 'verso-field-desc',
+        text: 'An estimate based on total page count, not your reader\u2019s exact position \u2014 it may not move if you\u2019ve only read a few pages today.'
+      });
+    } else {
+      field.createEl('label', { text: 'You read to page', cls: 'verso-field-label' });
+
+      const input = field.createEl('input', { type: 'number', cls: 'verso-input' });
+      input.value = String(this.actualEnd);
+      input.min = String(this.chunk.pagesStart);
+      input.max = String(this.book.totalPages);
+      input.addEventListener('input', (e) => {
+        const raw = e.target.value;
+        this.actualEnd = raw === '' ? null : parseInt(raw, 10);
+        this.updateConfirmButtonState();
+      });
+
+      field.createEl('div', {
+        cls: 'verso-field-desc',
+        text: 'Pre-filled with where you were headed. Adjust it to match where you actually landed.'
+      });
+    }
+
+    // Says why "Mark read" is disabled instead of leaving the button
+    // silently greyed out. (v1.3.2)
+    this.errorEl = field.createDiv({ cls: 'verso-field-error' });
 
     const buttons = contentEl.createDiv({ cls: 'verso-confirm-buttons' });
 
@@ -3190,7 +4422,10 @@ class VersoPagesReadModal extends Modal {
 
     this.confirmBtn = buttons.createEl('button', { text: 'Mark read', cls: 'verso-btn verso-btn-primary' });
     this.confirmBtn.addEventListener('click', async () => {
-      if (!this.isValid()) return;
+      // Guard against a double-click logging the chunk (and its session) twice.
+      if (this.submitted || !this.isValid()) return;
+      this.submitted = true;
+      this.confirmBtn.disabled = true;
       const actualEnd = this.actualEnd;
       this.close();
       let bookJustCompleted = false;
@@ -3207,23 +4442,72 @@ class VersoPagesReadModal extends Modal {
 
     this.updateConfirmButtonState();
 
+    // Enter submits, same as clicking "Mark read". (v1.3.2)
+    const activeInput = field.querySelector('input');
+    activeInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.isComposing) {
+        e.preventDefault();
+        this.confirmBtn.click();
+      }
+    });
+
     // Focus + select so an override is just "type the number"
-    window.setTimeout(() => { input.focus(); input.select(); }, 0);
+    window.setTimeout(() => { activeInput.focus(); activeInput.select(); }, 0);
+  }
+
+  // Whole percent of the book at a given page — the same rounding the
+  // pre-fill and chunk labels use.
+  pageToPercent(page) {
+    return Math.round((page / this.book.totalPages) * 100);
+  }
+
+  // Percent → page. One percent can span many pages, so a percent that
+  // rounds to today's starting percent can land a page or two before
+  // pagesStart. Clamp it up to pagesStart rather than rejecting it — the
+  // reader typed exactly what their e-reader shows. (v1.3.2)
+  percentToPage(percent) {
+    if (percent === null || Number.isNaN(percent)) return null;
+    // Typing back the pre-filled percent means "on plan" — keep the exact
+    // scheduled page rather than a rounded one that reads as a few pages behind.
+    if (percent === this.pageToPercent(this.scheduledEnd)) return this.scheduledEnd;
+    const page = Math.round(this.book.totalPages * (percent / 100));
+    if (page < this.chunk.pagesStart && percent >= this.pageToPercent(this.chunk.pagesStart)) {
+      return this.chunk.pagesStart;
+    }
+    return page;
+  }
+
+  // Returns null when valid, otherwise a short reason for the reader.
+  validationError() {
+    const v = this.actualEnd;
+    const start = this.chunk.pagesStart;
+    const total = this.book.totalPages;
+    if (this.isPercentMode) {
+      const p = this.actualPercent;
+      if (p === null || Number.isNaN(p)) return 'Enter a percent.';
+      if (p > 100) return 'Enter a percent from 0 to 100.';
+      if (v === null || v < start) {
+        return `Today's reading starts at about ${this.pageToPercent(start)}%. Enter that or higher.`;
+      }
+      return null;
+    }
+    if (v === null || Number.isNaN(v)) return 'Enter a page number.';
+    if (v < start) return `Today's reading starts on page ${start}. Enter ${start} or higher.`;
+    if (v > total) return `This book has ${total} pages.`;
+    return null;
   }
 
   isValid() {
-    const v = this.actualEnd;
-    if (v === null || Number.isNaN(v)) return false;
-    if (v < this.chunk.pagesStart) return false;
-    if (v > this.book.totalPages) return false;
-    return true;
+    return this.validationError() === null;
   }
 
   updateConfirmButtonState() {
     if (!this.confirmBtn) return;
-    const valid = this.isValid();
+    const error = this.validationError();
+    const valid = error === null;
     this.confirmBtn.disabled = !valid;
     this.confirmBtn.toggleClass('verso-btn-disabled', !valid);
+    if (this.errorEl) this.errorEl.setText(error || '');
   }
 
   // Branch the post-confirm toast on where they actually landed.
@@ -3275,6 +4559,94 @@ class VersoPagesReadModal extends Modal {
 // "Books finished this year" stat already uses. Nothing new is stored for
 // it; it's a different rendering of data that already exists.
 
+// Quotes shown on the completion modal, picked at random each time a book
+// finishes. Split at 500 pages — long books get a separate, smaller pool
+// rather than a shared one, since a quote about finishing a doorstop reads
+// oddly attached to a 180-page novel. (LiveAQuietLife, 2026-09-06)
+// v1.3.2: long books also draw from the standard pool, and quotes don't
+// repeat until the pool is used up (see versoPickCompleteQuote).
+// Attributions checked in v1.3.2; misattributed lines were replaced or
+// re-credited.
+const VERSO_COMPLETE_QUOTES_STANDARD = [
+  { text: 'If you have a garden in your library, you will lack nothing.', author: 'Cicero' },
+  { text: 'From that moment, I understood the pathway from slavery to freedom.', author: 'Frederick Douglass' },
+  { text: 'There is no Frigate like a Book / To take us Lands away.', author: 'Emily Dickinson' },
+  { text: 'Books are a uniquely portable magic.', author: 'Stephen King' },
+  { text: 'The world was hers for the reading.', author: 'Betty Smith' },
+  { text: 'Reading is breathing in; writing is breathing out.', author: 'Pam Allyn' },
+  { text: 'If you read only the books that everyone else is reading, you can only think what everyone else is thinking.', author: 'Haruki Murakami' },
+  { text: 'Wear the old coat and buy the new book.', author: 'Austin Phelps' },
+  // Added in v1.3.2, checked against their sources.
+  { text: 'If one cannot enjoy reading a book over and over again, there is no use reading it at all.', author: 'Oscar Wilde' },
+  { text: 'Never trust anyone who has not brought a book with them.', author: 'Lemony Snicket' },
+  { text: "Books are the ultimate Dumpees: put them down and they'll wait for you forever; pay attention to them and they always love you back.", author: 'John Green' },
+  { text: 'I, who had always thought of Paradise / in form and image as a library', author: 'Jorge Luis Borges, tr. Alastair Reid' },
+  { text: 'I declare after all there is no enjoyment like reading! How much sooner one tires of any thing than of a book!', author: 'Jane Austen' },
+  { text: 'I cannot live without books.', author: 'Thomas Jefferson' },
+  { text: 'Read the best books first, or you may not have a chance to read them at all.', author: 'Henry David Thoreau' },
+  { text: 'If a book is worth reading, it is worth buying.', author: 'John Ruskin' },
+  { text: 'All good books are alike in that they are truer than if they had really happened.', author: 'Ernest Hemingway' },
+  { text: 'Books are mirrors: you only see in them what you already have inside you.', author: 'Carlos Ruiz Zafón' },
+  { text: "'Tis the good reader that makes the good book.", author: 'Ralph Waldo Emerson' },
+  { text: 'If you love books enough, books will love you back.', author: 'Jo Walton' },
+  { text: 'A book must be the axe for the frozen sea inside us.', author: 'Franz Kafka' },
+  { text: 'A book is a version of the world. If you do not like it, ignore it; or offer your own version in return.', author: 'Salman Rushdie' },
+  { text: 'A man will turn over half a library to make one book.', author: 'Samuel Johnson' },
+  { text: 'Rereading, we find a new book.', author: 'Mason Cooley' },
+  { text: 'In a sense, one can never read the book that the author originally wrote, and one can never read the same book twice.', author: 'Edmund Wilson' },
+  { text: 'Always read something that will make you look good if you die in the middle of it.', author: "P.J. O'Rourke" },
+  { text: 'A book is the only place in which you can examine a fragile thought without breaking it.', author: 'Edward P. Morgan' },
+  { text: 'A book is proof that humans are capable of working magic.', author: 'Carl Sagan' },
+  { text: 'Books are the guides of youth and the entertainment of age. They support us under solitude, and keep us from being a burden to ourselves.', author: 'Jeremy Collier' }
+];
+
+const VERSO_COMPLETE_QUOTES_LONG = [
+  { text: "It is what you read when you don't have to that determines what you will be when you can't help it.", author: 'Charles Francis Potter' },
+  { text: 'Some books leave us free, and some books make us free.', author: 'Ralph Waldo Emerson' },
+  { text: 'A great book should leave you with many experiences, and slightly exhausted.', author: 'William Styron' },
+  { text: 'Long books, when read, are usually overpraised, because the reader wishes to convince others and himself that he has not wasted his time.', author: 'E.M. Forster' },
+  { text: 'Books are the quietest and most constant of friends; they are the most accessible and wisest of counselors, and the most patient of teachers.', author: 'Charles William Eliot' },
+  // Added in v1.3.2, checked against their sources.
+  { text: 'A mind needs books as a sword needs a whetstone, if it is to keep its edge.', author: 'George R.R. Martin' },
+  { text: "What really knocks me out is a book that, when you're all done reading it, you wish the author that wrote it was a terrific friend of yours and you could call him up on the phone whenever you felt like it.", author: 'J.D. Salinger' },
+  { text: 'A reader lives a thousand lives before he dies. The man who never reads lives only one.', author: 'George R.R. Martin' }
+];
+
+const VERSO_LONG_BOOK_PAGE_CUTOFF = 500;
+
+// No repeats until a pool is used up (v1.3.2). Long books draw from both
+// pools; other books draw from the standard pool only, so a quote about
+// finishing a doorstop never lands on a short novel. Shown quotes are
+// tracked by text in settings.quotesShown, shared across both pools, so a
+// standard quote shown for a long book isn't repeated for a short one.
+// When every quote in the book's pool has been shown, that pool's quotes
+// are cleared from the list and the cycle starts again.
+function versoPickCompleteQuote(plugin, totalPages) {
+  const pool = (totalPages >= VERSO_LONG_BOOK_PAGE_CUTOFF)
+    ? [...VERSO_COMPLETE_QUOTES_LONG, ...VERSO_COMPLETE_QUOTES_STANDARD]
+    : VERSO_COMPLETE_QUOTES_STANDARD;
+
+  const settings = plugin && plugin.settings;
+  if (!settings) return pool[Math.floor(Math.random() * pool.length)];
+
+  // Drop texts of quotes that no longer exist (edited or removed).
+  const allTexts = new Set([...VERSO_COMPLETE_QUOTES_STANDARD, ...VERSO_COMPLETE_QUOTES_LONG].map(q => q.text));
+  let shown = (settings.quotesShown || []).filter(t => allTexts.has(t));
+
+  let unseen = pool.filter(q => !shown.includes(q.text));
+  if (unseen.length === 0) {
+    const poolTexts = new Set(pool.map(q => q.text));
+    shown = shown.filter(t => !poolTexts.has(t));
+    unseen = pool;
+  }
+
+  const quote = unseen[Math.floor(Math.random() * unseen.length)];
+  shown.push(quote.text);
+  settings.quotesShown = shown;
+  plugin.saveSettings();
+  return quote;
+}
+
 class VersoBookCompleteModal extends Modal {
   constructor(app, plugin, bookId) {
     super(app);
@@ -3306,12 +4678,12 @@ class VersoBookCompleteModal extends Modal {
     metaParts.push(`${book.totalPages} pages`);
     headerInfo.createDiv({ text: metaParts.join(' · '), cls: 'verso-complete-meta' });
 
-    // ── Voice copy ──────────────────────────────────────────────
-    contentEl.createDiv({ text: 'You read the whole thing.', cls: 'verso-complete-headline' });
-    contentEl.createDiv({
-      text: `${book.totalPages} pages. That's not nothing.`,
-      cls: 'verso-complete-subtext'
-    });
+    // ── Voice copy: a book quote, picked at random per completion ─
+    // Page count is already shown in the header meta above, so the quote
+    // stands alone rather than repeating it. (LiveAQuietLife, 2026-09-06)
+    const quote = versoPickCompleteQuote(this.plugin, book.totalPages);
+    contentEl.createDiv({ text: `\u201C${quote.text}\u201D`, cls: 'verso-complete-headline' });
+    contentEl.createDiv({ text: `— ${quote.author}`, cls: 'verso-complete-quote-author' });
 
     // ── Reschedule honesty ──────────────────────────────────────
     const original = book.originalTargetFinishDate;
@@ -3332,7 +4704,7 @@ class VersoBookCompleteModal extends Modal {
     // ── Shelf: every book completed this calendar year ──────────
     const currentYear = new Date().getFullYear();
     const shelfBooks = this.plugin.settings.books
-      .filter(b => b.status === 'complete' && b.dateCompleted)
+      .filter(b => versoIsFinishedBook(b) && b.dateCompleted)
       .filter(b => new Date(b.dateCompleted).getFullYear() === currentYear)
       .sort((a, b) => new Date(a.dateCompleted) - new Date(b.dateCompleted));
 
@@ -3362,7 +4734,7 @@ class VersoBookCompleteModal extends Modal {
     const addButton = rightGroup.createEl('button', { text: '+ Add your next book', cls: 'verso-btn verso-btn-primary' });
     addButton.addEventListener('click', () => {
       this.close();
-      new AddBookModal(this.app, this.plugin, () => this.plugin.refreshOpenDashboard()).open();
+      new AddBookModal(this.app, this.plugin, () => this.plugin.refreshAllViews()).open();
     });
   }
 
@@ -3404,7 +4776,9 @@ class AddBookModal extends Modal {
       startDate: this.getTodayString(),
       targetFinishDate: '',
       overrideReadingDays: false,
-      customReadingDays: this.getGlobalReadingDaysAsObject()
+      customReadingDays: this.getGlobalReadingDaysAsObject(),
+      // 'page' or 'percent' — see progressInputMode on the book itself.
+      progressInputMode: 'page'
     };
   }
 
@@ -3504,6 +4878,10 @@ class AddBookModal extends Modal {
       this.formData.title = e.target.value;
       this.updateNextButtonState();
     });
+    titleInput.addEventListener('blur', (e) => {
+      this.formData.title = versoTitleCase(e.target.value);
+      e.target.value = this.formData.title;
+    });
 
     // ── Author ───────────────────────────────────────────────
     const authorField = form.createDiv({ cls: 'verso-field' });
@@ -3516,6 +4894,10 @@ class AddBookModal extends Modal {
     authorInput.value = this.formData.author;
     authorInput.addEventListener('input', (e) => {
       this.formData.author = e.target.value;
+    });
+    authorInput.addEventListener('blur', (e) => {
+      this.formData.author = versoNameCase(e.target.value);
+      e.target.value = this.formData.author;
     });
 
     // ── Total pages (required) ──────────────────────────────────
@@ -3533,6 +4915,31 @@ class AddBookModal extends Modal {
       const value = parseInt(e.target.value, 10);
       this.formData.totalPages = isNaN(value) ? null : value;
       this.updateNextButtonState();
+    });
+
+    // ── Percent-based progress (e-readers) ────────────────────────
+    // For readers like Kindle/Kobo that only expose a percent-complete
+    // figure, not a page number. Total pages above is still required —
+    // it's the number percent gets converted against — this only changes
+    // what you type in day to day. (LiveAQuietLife, 2026-09-04)
+    const percentModeField = form.createDiv({ cls: 'verso-field verso-field-toggle' });
+    const percentModeLabel = percentModeField.createEl('label', { cls: 'verso-toggle-label' });
+    const percentModeCheckbox = percentModeLabel.createEl('input', {
+      type: 'checkbox',
+      cls: 'verso-checkbox'
+    });
+    percentModeCheckbox.checked = this.formData.progressInputMode === 'percent';
+    percentModeLabel.createSpan({ text: 'Track progress by percentage instead of page number' });
+    percentModeCheckbox.addEventListener('change', (e) => {
+      this.formData.progressInputMode = e.target.checked ? 'percent' : 'page';
+    });
+    // Sibling of percentModeField, not nested inside it — verso-field-toggle
+    // is row-flex (built for a single checkbox+label child), so a desc
+    // nested inside it gets laid out beside the checkbox instead of below
+    // it. (LiveAQuietLife, 2026-09-05)
+    form.createEl('div', {
+      cls: 'verso-field-desc',
+      text: "For e-readers (Kindle, Kobo, etc.) that only show a percent, not a page number."
     });
 
     // ── Cover color ──────────────────────────────────────────────
@@ -3560,7 +4967,7 @@ class AddBookModal extends Modal {
     body.createDiv({ cls: 'verso-section-label', text: 'SCHEDULE DETAILS' });
 
     const form = body.createDiv({ cls: 'verso-form' });
-    const collectionTerm = this.getCollectionTerm();
+    const collectionTerm = versoCollectionTerm(this.plugin.settings);
 
     // ── When to start ────────────────────────────────────────────
     const modeField = form.createDiv({ cls: 'verso-field' });
@@ -3591,7 +4998,7 @@ class AddBookModal extends Modal {
     // ── Collection picker ───────────────────────────────────────
     const collectionField = form.createDiv({ cls: 'verso-field' });
     collectionField.createEl('label', {
-      text: this.capitalize(collectionTerm),
+      text: versoCapitalize(collectionTerm),
       cls: 'verso-field-label'
     });
 
@@ -3604,7 +5011,7 @@ class AddBookModal extends Modal {
     });
 
     const newOpt = collectionSelect.createEl('option', {
-      text: `+ New ${this.singularize(collectionTerm)}`,
+      text: `+ New ${versoCollectionTermSingular(this.plugin.settings)}`,
       value: '__new__'
     });
 
@@ -3619,13 +5026,13 @@ class AddBookModal extends Modal {
     // Container for the inline "new collection" name field
     const newCollectionField = form.createDiv({ cls: 'verso-field verso-field-indent' });
     newCollectionField.createEl('label', {
-      text: `New ${this.singularize(collectionTerm)} name`,
+      text: `New ${versoCollectionTermSingular(this.plugin.settings)} name`,
       cls: 'verso-field-label'
     });
     const newCollectionInput = newCollectionField.createEl('input', {
       type: 'text',
       cls: 'verso-input',
-      attr: { placeholder: `e.g. ${this.exampleCollectionName(collectionTerm)}` }
+      attr: { placeholder: `e.g. ${versoExampleCollectionName(collectionTerm)}` }
     });
     newCollectionInput.value = this.formData.newCollectionName;
     newCollectionInput.addEventListener('input', (e) => {
@@ -3736,42 +5143,6 @@ class AddBookModal extends Modal {
 
   // ── Step 2 helpers ─────────────────────────────────────────────
 
-  getCollectionTerm() {
-    const term = this.plugin.settings.collectionTerm;
-    if (term === 'custom') {
-      return this.plugin.settings.collectionTermCustom || 'collection';
-    }
-    return term;
-  }
-
-  capitalize(str) {
-    if (!str) return str;
-    return str.charAt(0).toUpperCase() + str.slice(1);
-  }
-
-  // Crude singularization for the built-in terms (all plural words/lists)
-  singularize(term) {
-    const map = {
-      classes: 'class',
-      projects: 'project',
-      subjects: 'subject',
-      lists: 'list',
-      shelves: 'shelf'
-    };
-    return map[term] || term;
-  }
-
-  exampleCollectionName(term) {
-    const examples = {
-      classes: 'OT Survey',
-      projects: 'Summer reading',
-      subjects: 'Bible',
-      lists: 'To read',
-      shelves: 'Currently reading'
-    };
-    return examples[term] || 'New collection';
-  }
-
 
   renderConfirmStep(body) {
     // ── Your book ────────────────────────────────────────────────
@@ -3806,14 +5177,14 @@ class AddBookModal extends Modal {
 
     const summaryTable = body.createDiv({ cls: 'verso-summary-table' });
 
-    const collectionTerm = this.getCollectionTerm();
+    const collectionTerm = versoCollectionTerm(this.plugin.settings);
     const collectionName = this.formData.collectionId
       ? (this.plugin.settings.collections.find(c => c.id === this.formData.collectionId)?.name || '—')
       : this.formData.newCollectionName;
 
-    this.addSummaryRow(summaryTable, this.capitalize(this.singularize(collectionTerm)), collectionName);
+    versoAddSummaryRow(summaryTable, versoCapitalize(versoCollectionTermSingular(this.plugin.settings)), collectionName);
     if (this.formData.targetFinishDate) {
-      this.addSummaryRow(summaryTable, 'Due date', this.formatDate(this.formData.targetFinishDate));
+      versoAddSummaryRow(summaryTable, 'Due date', this.formatDateLong(this.formData.targetFinishDate));
     }
 
     const noteBox = body.createDiv({ cls: 'verso-pace-note' });
@@ -3833,16 +5204,24 @@ class AddBookModal extends Modal {
 
     const summaryTable = body.createDiv({ cls: 'verso-summary-table' });
 
-    const collectionTerm = this.getCollectionTerm();
+    const collectionTerm = versoCollectionTerm(this.plugin.settings);
     const collectionName = this.formData.collectionId
       ? (this.plugin.settings.collections.find(c => c.id === this.formData.collectionId)?.name || '—')
       : this.formData.newCollectionName;
 
-    this.addSummaryRow(summaryTable, this.capitalize(this.singularize(collectionTerm)), collectionName);
-    this.addSummaryRow(summaryTable, 'Start date', this.formatDate(this.formData.startDate));
-    this.addSummaryRow(summaryTable, 'Finish by', this.formatDate(this.formData.targetFinishDate));
-    this.addSummaryRow(summaryTable, 'Reading days', this.describeReadingDays());
-    this.addSummaryRow(summaryTable, 'Total reading days', String(preview.readingDayCount));
+    versoAddSummaryRow(summaryTable, versoCapitalize(versoCollectionTermSingular(this.plugin.settings)), collectionName);
+    versoAddSummaryRow(summaryTable, 'Start date', this.formatDateLong(this.formData.startDate));
+    versoAddSummaryRow(summaryTable, 'Finish by', this.formatDateLong(this.formData.targetFinishDate));
+    versoAddSummaryRow(summaryTable, 'Reading days', this.describeReadingDays());
+    versoAddSummaryRow(summaryTable, 'Total reading days', String(preview.readingDayCount));
+
+    if (this.formData.startDate < versoToday()) {
+      const startedNote = body.createDiv({ cls: 'verso-pace-note' });
+      startedNote.setText(
+        "You started before today, so your schedule begins today. If you've already read some of it, " +
+        "enter the page you're on when you mark today's reading."
+      );
+    }
 
     // ── Pace note ────────────────────────────────────────────────
     if (preview.readingDayCount === 0) {
@@ -3890,7 +5269,8 @@ class AddBookModal extends Modal {
       id: '__preview__',
       totalPages: this.formData.totalPages,
       startDate: this.formData.startDate,
-      targetFinishDate: this.formData.targetFinishDate
+      targetFinishDate: this.formData.targetFinishDate,
+      progressInputMode: this.formData.progressInputMode
     };
 
     const readingDays = this.formData.overrideReadingDays
@@ -3901,7 +5281,7 @@ class AddBookModal extends Modal {
 
     const chunks = generateSchedule(tempBook, readingDays);
     const readingDayCount = countReadingDays(
-      this.formData.startDate,
+      versoScheduleFrom(this.formData.startDate),
       this.formData.targetFinishDate,
       readingDays
     );
@@ -3909,22 +5289,16 @@ class AddBookModal extends Modal {
     return { chunks, readingDayCount, readingDays };
   }
 
-  addSummaryRow(table, label, value) {
-    const row = table.createDiv({ cls: 'verso-summary-row' });
-    row.createEl('span', { text: label, cls: 'verso-summary-label' });
-    row.createEl('span', { text: value, cls: 'verso-summary-value' });
-  }
-
   renderChunkPreviewCard(body, headerText, chunk) {
     const card = body.createDiv({ cls: 'verso-chunk-preview-card' });
-    card.createDiv({ cls: 'verso-chunk-preview-header', text: `${headerText} — ${this.formatDate(chunk.scheduledDate)}` });
+    card.createDiv({ cls: 'verso-chunk-preview-header', text: `${headerText} — ${this.formatDateLong(chunk.scheduledDate)}` });
     card.createDiv({ cls: 'verso-chunk-preview-label', text: chunk.label });
   }
 
-  formatDate(dateString) {
-    if (!dateString) return '—';
-    const date = new Date(dateString + 'T00:00:00');
-    return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  // Long form (includes the year) — the confirm step shows dates out of
+  // context, so 'Jul 26' alone would be ambiguous across a year boundary.
+  formatDateLong(dateString) {
+    return versoFormatDateLong(dateString);
   }
 
   describeReadingDays() {
@@ -4007,25 +5381,40 @@ class AddBookModal extends Modal {
         text: 'Add another book',
         cls: 'verso-btn verso-btn-secondary'
       });
-      addAnotherBtn.addEventListener('click', async () => {
-        await this.saveBook();
-        new Notice(`"${this.formData.title}" added.`);
-        if (this.onSave) this.onSave();
-        this.resetForm();
-        this.goToStep(0);
-      });
-
       const confirmBtn = rightGroup.createEl('button', {
         text: 'Confirm and go to dashboard',
         cls: 'verso-btn verso-btn-primary'
       });
-      confirmBtn.addEventListener('click', async () => {
-        await this.saveBook();
-        new Notice(`"${this.formData.title}" added.`);
-        if (this.onSave) this.onSave();
+
+      // Both buttons save, and saving is async — without a guard, a
+      // double-click (or clicking one then the other) added the same book
+      // twice. Disable both for the duration of the save.
+      const saveOnce = async (after) => {
+        if (this.saving) return;
+        this.saving = true;
+        addAnotherBtn.disabled = true;
+        confirmBtn.disabled = true;
+        try {
+          await this.saveBook();
+          new Notice(`"${this.formData.title}" added.`);
+          if (this.onSave) this.onSave();
+          await after();
+        } finally {
+          this.saving = false;
+          addAnotherBtn.disabled = false;
+          confirmBtn.disabled = false;
+        }
+      };
+
+      addAnotherBtn.addEventListener('click', () => saveOnce(async () => {
+        this.resetForm();
+        this.goToStep(0);
+      }));
+
+      confirmBtn.addEventListener('click', () => saveOnce(async () => {
         this.close();
         await this.plugin.activateDashboardView();
-      });
+      }));
     }
   }
 
@@ -4051,7 +5440,8 @@ class AddBookModal extends Modal {
         coverColor: this.formData.coverColor,
         collectionId: collectionId,
         targetFinishDate: this.formData.targetFinishDate || null,
-        status: 'planned'
+        status: 'planned',
+        progressInputMode: this.formData.progressInputMode
       });
       return;
     }
@@ -4068,7 +5458,8 @@ class AddBookModal extends Modal {
       collectionId: collectionId,
       startDate: this.formData.startDate,
       targetFinishDate: this.formData.targetFinishDate,
-      readingDaysOverride: readingDaysOverride
+      readingDaysOverride: readingDaysOverride,
+      progressInputMode: this.formData.progressInputMode
     });
   }
 
@@ -4085,7 +5476,8 @@ class AddBookModal extends Modal {
       startDate: this.getTodayString(),
       targetFinishDate: '',
       overrideReadingDays: false,
-      customReadingDays: this.getGlobalReadingDaysAsObject()
+      customReadingDays: this.getGlobalReadingDaysAsObject(),
+      progressInputMode: 'page'
     };
   }
 
@@ -4113,9 +5505,15 @@ class AddBookModal extends Modal {
           return hasCollection;
         }
 
+        // Verso doesn't support backdating a schedule, so the finish date
+        // has to be today or later — same rule VersoEditBookModal
+        // already enforces. Start date can still be in the past (a book
+        // someone actually started a few days ago), but the finish date is
+        // a forward commitment and can't already be broken at creation.
         const hasDates = this.formData.startDate && this.formData.targetFinishDate;
         const datesValid = hasDates &&
-          this.formData.targetFinishDate >= this.formData.startDate;
+          this.formData.targetFinishDate >= this.formData.startDate &&
+          this.formData.targetFinishDate >= versoToday();
         const hasReadingDay = !this.formData.overrideReadingDays ||
           Object.values(this.formData.customReadingDays).some(v => v === true);
         return hasCollection && datesValid && hasReadingDay;
@@ -4141,12 +5539,17 @@ class AddBookModal extends Modal {
           message = 'Enter a title and page count to continue';
         } else if (step.key === 'schedule') {
           if (this.formData.addMode === 'later') {
-            message = `Choose a ${this.singularize(this.getCollectionTerm())} to continue`;
+            message = `Choose a ${versoCollectionTermSingular(this.plugin.settings)} to continue`;
           } else {
             const hasReadingDay = !this.formData.overrideReadingDays ||
               Object.values(this.formData.customReadingDays).some(v => v === true);
+            const hasDates = this.formData.startDate && this.formData.targetFinishDate;
             if (!hasReadingDay) {
               message = 'Select at least one reading day to continue';
+            } else if (hasDates && this.formData.targetFinishDate < this.formData.startDate) {
+              message = 'Finish date must be on or after the start date';
+            } else if (hasDates && this.formData.targetFinishDate < versoToday()) {
+              message = "Finish date can't be in the past";
             } else {
               message = 'Enter a collection, start date, and finish date to continue';
             }
@@ -4198,9 +5601,25 @@ class VersoSettingTab extends PluginSettingTab {
       );
 
     if (this.plugin.settings.collectionTerm === 'custom') {
+      // Both forms are asked for outright. Verso uses the singular in most
+      // places ("+ New course", "Choose a course to continue") and the plural
+      // in a few, and guessing one from the other gets English wrong often
+      // enough to be worse than a second field.
       new Setting(containerEl)
-        .setName('Custom term')
-        .setDesc('Singular form — e.g. "Course", "Module", "Track"')
+        .setName('Custom term (plural)')
+        .setDesc('e.g. "Courses", "Modules", "Tracks"')
+        .addText(text => text
+          .setPlaceholder('e.g. Courses, Modules, Tracks...')
+          .setValue(this.plugin.settings.collectionTermCustomPlural)
+          .onChange(async (value) => {
+            this.plugin.settings.collectionTermCustomPlural = value;
+            await this.plugin.saveSettings();
+          })
+        );
+
+      new Setting(containerEl)
+        .setName('Custom term (singular)')
+        .setDesc('e.g. "Course", "Module", "Track"')
         .addText(text => text
           .setPlaceholder('e.g. Course, Module, Track...')
           .setValue(this.plugin.settings.collectionTermCustom)
@@ -4229,6 +5648,7 @@ class VersoSettingTab extends PluginSettingTab {
         .onChange(async (value) => {
           this.plugin.settings.readingDays = value;
           await this.plugin.saveSettings();
+          await this.rescheduleForNewReadingDays();
           this.display();
         })
       );
@@ -4251,6 +5671,7 @@ class VersoSettingTab extends PluginSettingTab {
             .onChange(async (value) => {
               this.plugin.settings.customReadingDays[day.key] = value;
               await this.plugin.saveSettings();
+              await this.rescheduleForNewReadingDays();
             })
           );
       });
@@ -4262,6 +5683,26 @@ class VersoSettingTab extends PluginSettingTab {
       text: `Verso v${this.plugin.manifest.version} — Your reading life, scheduled.`,
       cls: 'verso-settings-desc'
     });
+  }
+
+  // Changing the default reading days used to leave every existing schedule
+  // on the old days until the next restart. Recalculate active books that
+  // follow the default (books with their own override come out unchanged).
+  //
+  // Skipped while a custom selection has no days at all: with zero reading
+  // days every book would count as off-pace, and the off-pace freeze would
+  // turn all upcoming chunks — including future-dated ones — into permanent
+  // 'missed' history. That's an in-between state of the toggles, not a real
+  // choice, so wait until at least one day is selected again.
+  async rescheduleForNewReadingDays() {
+    const settings = this.plugin.settings;
+    if (settings.readingDays === 'custom' &&
+        !Object.values(settings.customReadingDays).some(v => v === true)) {
+      new Notice('Select at least one reading day — schedules will update once you do.');
+      return;
+    }
+    const changed = await this.plugin.recalculateAllBooks();
+    if (changed) this.plugin.refreshAllViews();
   }
 }
 

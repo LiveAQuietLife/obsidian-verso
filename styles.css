@@ -1,6 +1,6 @@
 /* 
  * Verso — Your reading life, scheduled.
- * v0.1.3 — Scaffold styles
+ * v1.3.2 — Scaffold styles
  */
 
 /* ─── Settings page ─────────────────────────────────────────── */
@@ -108,6 +108,38 @@
   min-height: 280px;
 }
 
+/* Mobile: Obsidian fits the modal to the screen, which squeezed the body
+   and let its content spill under the footer with no way to scroll.
+   The modal becomes a column: the body scrolls, and the header and
+   footer always stay whole. (v1.3.2) */
+.is-mobile .verso-add-book-modal {
+  display: flex;
+  flex-direction: column;
+}
+
+.is-mobile .verso-add-book-modal .modal-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.is-mobile .verso-add-book-modal .verso-modal-header,
+.is-mobile .verso-add-book-modal .verso-modal-footer {
+  flex-shrink: 0;
+}
+
+/* The body keeps a 160px floor. With the keyboard open, Obsidian shrinks
+   the modal to ~300px, and a body allowed to reach 0 hid the form; instead
+   the whole content scrolls. (v1.3.2, tested on the S25+ 10-12) */
+.is-mobile .verso-add-book-modal .verso-modal-body {
+  flex: 1 1 auto;
+  min-height: 160px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
 .verso-step-placeholder {
   color: var(--text-muted);
   font-style: italic;
@@ -117,6 +149,8 @@
 
 .verso-modal-footer {
   display: flex;
+  flex-wrap: wrap;
+  row-gap: 8px;
   justify-content: space-between;
   align-items: center;
   padding-top: 16px;
@@ -127,7 +161,18 @@
 .verso-footer-left,
 .verso-footer-right {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
+}
+
+/* Mobile: Back on its own line, then the save buttons sharing a row
+   evenly, instead of buttons wrapping into odd positions. (v1.3.2) */
+.is-mobile .verso-modal-footer .verso-footer-right {
+  flex: 1 1 100%;
+}
+
+.is-mobile .verso-modal-footer .verso-footer-right .verso-btn {
+  flex: 1 1 0;
 }
 
 .verso-btn {
@@ -186,9 +231,29 @@
   cursor: not-allowed;
 }
 
-.verso-btn-disabled:hover,
-.verso-btn:disabled:hover {
+/* Disabled buttons keep their resting look on hover, per variant. (v1.3.2:
+   this used to give every disabled button an accent background.) */
+.verso-btn-primary.verso-btn-disabled:hover,
+.verso-btn-primary:disabled:hover {
   background-color: var(--interactive-accent);
+}
+
+.verso-btn-secondary.verso-btn-disabled:hover,
+.verso-btn-secondary:disabled:hover {
+  background-color: var(--background-secondary);
+}
+
+.verso-btn-text.verso-btn-disabled:hover,
+.verso-btn-text:disabled:hover {
+  background-color: transparent;
+  color: var(--text-muted);
+}
+
+.verso-btn-danger.verso-btn-disabled:hover,
+.verso-btn-danger:disabled:hover {
+  background-color: transparent;
+  color: var(--color-red);
+  border-color: var(--background-modifier-border);
 }
 
 .verso-footer-hint {
@@ -212,40 +277,10 @@
 .verso-form {
   display: flex;
   flex-direction: column;
-  gap: 24px;
+  /* 24px was sized for the old five-field schedule form. Edit Book runs to
+     ten fields across two sections, where that spacing reads as sprawl. */
+  gap: 16px;
   max-width: 420px;
-}
-
-.verso-form-section-label {
-  font-size: 0.75em;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--text-muted);
-  margin: 0;
-  padding-bottom: 4px;
-  border-bottom: 1px solid var(--background-modifier-border);
-}
-
-.verso-field-inline {
-  flex-direction: row;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.verso-input-color {
-  width: 36px;
-  height: 28px;
-  padding: 2px;
-  border-radius: var(--radius-s);
-  border: 1px solid var(--background-modifier-border);
-  background-color: var(--background-primary);
-  cursor: pointer;
-}
-
-.verso-field-warning {
-  color: var(--text-warning, var(--text-muted));
-  font-style: italic;
 }
 
 .verso-field {
@@ -265,6 +300,16 @@
   font-size: 0.85em;
   margin-top: 4px;
   min-height: 1.2em;
+}
+
+/* Three fields now carry error slots (title, total pages, finish date), not
+   just one. Reserving 1.2em under each permanently left uneven gaps between
+   fields that have a slot and fields that don't. Collapse the slot while it's
+   empty; the layout shift when an error appears is a smaller cost than
+   persistent dead space in a form this long. */
+.verso-field-error:empty {
+  min-height: 0;
+  margin-top: 0;
 }
 
 .verso-field-label {
@@ -640,7 +685,17 @@
   color: var(--interactive-accent);
 }
 
-/* Same neutral register as .verso-badge-planned (nothing's wrong, it just
+/* Same neutral register as .verso-badge-planned/.verso-badge-not-started —
+   deliberately NOT red/orange like .verso-badge-at-risk/.verso-badge-behind.
+   Off-pace isn't "you're falling behind, hurry up" — the schedule has simply
+   stopped, which is a fact to note, not an alarm to raise. See Verso
+   future-works §1.1 for why this replaced the old missed-day/page counters. */
+.verso-badge-off-pace {
+  background-color: var(--background-modifier-border);
+  color: var(--text-muted);
+}
+
+/* Same neutral register as .verso-badge-not-started (nothing's wrong, it just
    hasn't begun yet) — distinguished from it by label text only ("Starts
    {date}" vs "Planned"), not by color, since both are "not active" states. */
 .verso-badge-not-started {
@@ -703,6 +758,11 @@
   margin-bottom: 10px;
 }
 
+.verso-progress-info {
+  flex: 1;
+  min-width: 0;
+}
+
 .verso-progress-title {
   font-weight: 600;
   font-size: 1.05em;
@@ -753,6 +813,13 @@
 }
 
 .verso-bar-planned {
+  background-color: var(--background-modifier-border);
+}
+
+/* No active pace to color-code once frozen — real progress still shows
+   (per §1.1's "the app can know about the pages read and still not care
+   about the missed schedule" framing), but neutral, not red/orange/green. */
+.verso-bar-off-pace {
   background-color: var(--background-modifier-border);
 }
 
@@ -935,6 +1002,7 @@
 
 .verso-library-row {
   display: flex;
+  flex-wrap: wrap; /* actions drop below the title on narrow panes (v1.3.2) */
   align-items: center;
   gap: 12px;
   padding: 10px 14px;
@@ -959,7 +1027,9 @@
 }
 
 .verso-library-info {
-  flex: 1;
+  /* A real basis, so the row wraps before the title gets squeezed. */
+  flex: 1 1 160px;
+  min-width: 0;
 }
 
 .verso-library-title {
@@ -981,8 +1051,10 @@
 
 .verso-library-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   flex-shrink: 0;
+  margin-left: auto;
 }
 
 /* ─── Confirm Modal ────────────────────────────────────────── */
@@ -992,8 +1064,17 @@
   line-height: 1.5;
 }
 
+/* Inside a form, the flex gap already spaces this text — the browser's
+   default <p> margin stacks on top of it and leaves the section label
+   floating well above its own explanatory line. Scoped to .verso-form so
+   the standalone confirm modals keep their normal paragraph spacing. */
+.verso-form > .verso-confirm-body {
+  margin: 0;
+}
+
 .verso-confirm-buttons {
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
   margin-top: 20px;
@@ -1064,6 +1145,29 @@
   margin-top: 1px;
 }
 
+/* Sidebar checkboxes get the same pointer and hover as the dashboard's.
+   Preview rows (tomorrow) aren't clickable, so they're left out. (v1.3.2) */
+.verso-today-sidebar-row:not(.verso-today-sidebar-row-preview) .verso-today-checkbox {
+  cursor: pointer;
+  transition: border-color 0.1s ease, background-color 0.1s ease;
+}
+
+.verso-today-sidebar-row:not(.verso-today-sidebar-row-preview) .verso-today-checkbox:hover {
+  border-color: var(--interactive-accent);
+}
+
+.verso-today-sidebar-row:not(.verso-today-sidebar-row-preview) .verso-today-checkbox-checked:hover {
+  background-color: var(--text-success);
+  border-color: var(--text-success);
+  opacity: 0.8;
+}
+
+/* Keyboard focus ring for the reading checkboxes. (v1.3.2) */
+.verso-today-checkbox:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+}
+
 /* ─── Book Complete modal ──────────────────────────────────── */
 
 .verso-complete-header {
@@ -1094,15 +1198,16 @@
 }
 
 .verso-complete-headline {
-  font-size: 1.3em;
+  font-size: 1.1em;
   font-weight: 600;
-  margin-bottom: 8px;
+  font-style: italic;
+  line-height: 1.4;
+  margin-bottom: 4px;
 }
 
-.verso-complete-subtext {
-  font-size: 0.9em;
+.verso-complete-quote-author {
+  font-size: 0.85em;
   color: var(--text-muted);
-  line-height: 1.5;
   margin-bottom: 16px;
 }
 
@@ -1159,4 +1264,28 @@
   font-size: 0.8em;
   color: var(--text-muted);
   margin-top: 8px;
+}
+
+/* ─── Toast ─────────────────────────────────────────────────── */
+
+/* Center-screen alternative to Obsidian's top-right Notice. Positioning and
+   appearance live here rather than inline in main.js so themes and user
+   snippets can override them; the fade-out is driven from JS. */
+.verso-toast {
+  position: fixed;
+  top: 40%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 99999;
+  max-width: 320px;
+  padding: 12px 18px;
+  border: none;
+  border-radius: 8px;
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  text-align: center;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  transition: opacity 0.3s ease;
+  /* Never block clicks on whatever sits underneath it. (v1.3.2) */
+  pointer-events: none;
 }
