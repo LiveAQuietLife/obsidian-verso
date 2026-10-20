@@ -50,6 +50,18 @@ Reading for a book club? Tracking a project? Working through a subject? Call you
 ### Flexible reading days
 Set your default reading days globally (every day, weekdays only, or custom), then override per book as needed.
 
+### Days off
+Going on a trip? Mark the dates, for all books or just one, and Verso schedules no reading on them. You choose whether finish dates stay put (a few more pages on the other days) or move later by the days lost, and Verso shows what each choice does before you save. If you find time to read on a day off anyway, click **Log reading** on the book's card and it counts.
+
+### Fill in a book from a note
+Keep book notes in your vault? In Add book, choose **Fill in from a note…** and Verso copies the title, author and page count from the note's properties. You pick which property names it reads in Settings.
+
+### Pages left today
+On desktop, the status bar shows how many pages you have left today. Click it to open the dashboard.
+
+### Sync-friendly
+If you sync your vault between devices, Verso merges changes made on each one instead of letting one device's copy overwrite the other's.
+
 ---
 
 ## Philosophy

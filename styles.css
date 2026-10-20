@@ -1,6 +1,6 @@
 /* 
  * Verso — Your reading life, scheduled.
- * v1.3.2 — Scaffold styles
+ * v1.3.3 — Scaffold styles
  */
 
 /* ─── Settings page ─────────────────────────────────────────── */
@@ -1288,4 +1288,141 @@
   transition: opacity 0.3s ease;
   /* Never block clicks on whatever sits underneath it. (v1.3.2) */
   pointer-events: none;
+}
+
+/* ─── Phone: room for Obsidian's floating navigation bar ──────
+ * On phones Obsidian's navigation bar floats over the bottom of the
+ * view, which hid the last book on the dashboard. Obsidian sets
+ * --view-bottom-spacing to the bar's height (plus the safe area) when
+ * the bar floats, and 0 otherwise; its own views pad by it. (v1.3.3) */
+
+.is-phone .workspace-leaf-content[data-type^="verso-"] > .view-content {
+  padding-bottom: calc(var(--view-bottom-spacing, 0px) + 16px);
+}
+
+/* ── Import from a note (v1.4.0) ─────────────────────────── */
+.verso-import-field {
+  align-items: flex-start;
+  padding-bottom: 4px;
+}
+
+.verso-field-warning {
+  color: var(--text-warning);
+  font-size: 0.85em;
+}
+
+/* ── Days off (v1.4.0) ───────────────────────────────────── */
+.verso-days-off-dates {
+  display: flex;
+  gap: 12px;
+}
+
+.verso-days-off-dates .verso-field {
+  flex: 1;
+}
+
+.verso-days-off-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.verso-days-off-effects {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 4px;
+}
+
+/* ── Up next on the finished-book screen (v1.4.0) ────────── */
+.verso-up-next-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+  margin-bottom: 12px;
+}
+
+.verso-up-next-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+}
+
+.verso-up-next-cover {
+  width: 10px;
+  align-self: stretch;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.verso-up-next-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.verso-up-next-title {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.verso-up-next-meta {
+  font-size: 0.8em;
+  color: var(--text-muted);
+}
+
+.verso-up-next-label {
+  margin-top: 18px;
+}
+
+.verso-progress-no-reading {
+  color: var(--text-muted);
+  font-size: 0.85em;
+  font-style: italic;
+  margin-top: 2px;
+}
+
+/* "Log reading" on a card with nothing scheduled today (v1.4.0) */
+.verso-log-reading-link {
+  font-style: normal;
+  cursor: pointer;
+}
+
+/* Days off reminder in Add book and Start reading (v1.4.0) */
+.verso-days-off-warning-btn {
+  margin-top: 8px;
+}
+
+.verso-dashboard-days-off {
+  color: var(--text-muted);
+  font-size: 0.85em;
+  margin: -4px 0 12px;
+  cursor: pointer;
+}
+
+.verso-dashboard-days-off:hover {
+  color: var(--text-normal);
+}
+
+.verso-days-off-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.verso-days-off-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
 }

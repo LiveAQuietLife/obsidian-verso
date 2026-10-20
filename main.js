@@ -1,11 +1,11 @@
 /*
  * Verso — Your reading life, scheduled.
- * v1.3.2 — Percent-mode "Mark read" message, restore asks for a new
- * finish date, archived-book and view-refresh fixes, sync reload, mobile
- * keyboard, keyboard access, and CSS fixes
+ * v1.3.3 — Sync merge: two devices' copies of data.json are merged record
+ * by record instead of one overwriting the other. Title case keeps capitals
+ * the reader typed and lowercases "'s".
  */
 
-const { Plugin, PluginSettingTab, Setting, Notice, Modal, ItemView } = require('obsidian');
+const { Plugin, PluginSettingTab, Setting, Notice, Modal, ItemView, FuzzySuggestModal, Platform } = require('obsidian');
 
 // ─── Date Helpers ─────────────────────────────────────────────────────────────
 //
@@ -120,7 +120,19 @@ const DEFAULT_SETTINGS = {
 
   // Texts of completion quotes already shown in the current cycle, so a
   // quote doesn't repeat until its pool has been used up. (v1.3.2)
-  quotesShown: []
+  quotesShown: [],
+
+  // ── Import from a note (v1.4.0) ─────────────────────────────
+  // Frontmatter property names read by "Fill in from a note" in Add book.
+  // Matched without regard to case, so "Author" finds "author".
+  importTitleProperty: 'title',
+  importAuthorProperty: 'author',
+  importPagesProperty: 'pages',
+
+  // ── Days off (v1.4.0) ───────────────────────────────────────
+  // Date ranges with no reading, for every book: [{ id, start, end, label }].
+  // One book's own days off live on the book as book.daysOff.
+  daysOff: []
 };
 
 // ─── Data Helpers ────────────────────────────────────────────────────────────
@@ -243,7 +255,33 @@ function versoToast(message, timeout = 4000) {
 
 // ─── Scheduling Helpers ──────────────────────────────────────────────────────
 
-function isDayEnabled(dayNumber, readingDays) {
+// ─── Days off (v1.4.0) ──────────────────────────────────────────────────────
+//
+// A days-off range is { id, start, end, label } with YYYY-MM-DD dates,
+// inclusive. getReadingDaysFor() wraps a book's weekly pattern as
+// { weekly, off } only when a range applies, so a book with no days off
+// takes exactly the same code paths as before.
+
+function versoWeeklyDays(readingDays) {
+  return readingDays && readingDays.weekly !== undefined ? readingDays.weekly : readingDays;
+}
+
+function versoIsDayOff(dateString, readingDays) {
+  const off = readingDays && readingDays.off;
+  return Array.isArray(off) && off.some(r => r.start <= dateString && dateString <= r.end);
+}
+
+function versoWithDaysOff(readingDays, ranges) {
+  const off = (ranges || []).filter(r => r && r.start && r.end);
+  return off.length ? { weekly: readingDays, off } : readingDays;
+}
+
+// dateString is optional; without it days off aren't checked.
+function isDayEnabled(dayNumber, readingDays, dateString) {
+  if (readingDays && readingDays.weekly !== undefined) {
+    if (dateString && versoIsDayOff(dateString, readingDays)) return false;
+    return isDayEnabled(dayNumber, readingDays.weekly);
+  }
   if (readingDays === 'everyday') return true;
   if (readingDays === 'weekdays') return dayNumber >= 1 && dayNumber <= 5;
   if (typeof readingDays === 'object') {
@@ -276,7 +314,7 @@ function countReadingDays(startDate, endDate, readingDays) {
   let count = 0;
   const current = new Date(start);
   while (current <= end) {
-    if (isDayEnabled(current.getDay(), readingDays)) count++;
+    if (isDayEnabled(current.getDay(), readingDays, versoLocalDateString(current))) count++;
     current.setDate(current.getDate() + 1);
   }
   return count;
@@ -302,6 +340,34 @@ function isOffPace(book, readingDays) {
   if (!book.targetFinishDate) return false;
   const today = versoToday();
   return countReadingDays(today, book.targetFinishDate, readingDays) <= 0;
+}
+
+// Reading days a book loses between now and its finish date when its
+// reading days change from `before` to `after` (e.g. days off are added).
+function versoReadingDaysLost(book, before, after) {
+  return versoReadingDaysLeft(book, before) - versoReadingDaysLeft(book, after);
+}
+
+// Reading days left in a book's schedule, from today (or its start date,
+// if later) through its finish date.
+function versoReadingDaysLeft(book, readingDays) {
+  const today = versoToday();
+  const from = book.startDate && book.startDate > today ? book.startDate : today;
+  if (!book.targetFinishDate || book.targetFinishDate < from) return 0;
+  return countReadingDays(from, book.targetFinishDate, readingDays);
+}
+
+// The finish date that gives a book back the reading days it lost, so the
+// daily pages stay about the same. Unchanged if nothing was lost.
+function versoFinishDateAfterDaysOff(book, before, after) {
+  let lost = versoReadingDaysLost(book, before, after);
+  if (lost <= 0) return book.targetFinishDate;
+  const d = versoParseLocalDate(book.targetFinishDate);
+  for (let i = 0; i < 3660 && lost > 0; i++) {
+    d.setDate(d.getDate() + 1);
+    if (isDayEnabled(d.getDay(), after, versoLocalDateString(d))) lost--;
+  }
+  return lost > 0 ? book.targetFinishDate : versoLocalDateString(d);
 }
 
 // Single source of truth for "is this chunk missed?" — a chunk already marked
@@ -514,8 +580,9 @@ function getReadingDateRange(startDate, endDate, readingDays) {
   const current = new Date(start);
 
   while (current <= end) {
-    if (isDayEnabled(current.getDay(), readingDays)) {
-      dates.push(versoLocalDateString(current));
+    const dateString = versoLocalDateString(current);
+    if (isDayEnabled(current.getDay(), readingDays, dateString)) {
+      dates.push(dateString);
     }
     current.setDate(current.getDate() + 1);
   }
@@ -546,21 +613,30 @@ function buildChunkLabel(pagesStart, pagesEnd, book) {
 // that minor word is the first or last word of the title, which is always
 // capitalized regardless. Standard title-case convention.
 //
-// Known limitation: this can't know about names with internal capitals
-// ("McDonald", "MacArthur") — those come out as "Mcdonald" /
-// "Macarthur". No general fix without a name database; flagging rather
-// than hiding it. (LiveAQuietLife, 2026-09-05)
+// A word the reader typed with capitals inside it is left as typed: all
+// caps ("YHWH", "NT") or mixed case ("McDonald", "iPhone"). Typed in
+// lowercase, "mcdonald" still comes out "Mcdonald". (v1.3.3)
 const VERSO_TITLE_MINOR_WORDS = new Set([
   'a', 'an', 'the', 'and', 'but', 'or', 'nor', 'for', 'so', 'yet',
   'as', 'at', 'by', 'in', 'of', 'on', 'per', 'to', 'up', 'via', 'vs'
 ]);
 
 function versoCapitalizeWord(word) {
+  // Capitals the reader typed inside the word are kept (v1.3.3).
+  const letters = word.replace(/[^A-Za-z]/g, '');
+  if (letters.length >= 2 && letters === letters.toUpperCase()) return word;
+  if (/[a-z][A-Z]/.test(word)) return word;
+
   // Capitalize each segment around hyphens/apostrophes so "o'brien" ->
-  // "O'Brien" and "jean-claude" -> "Jean-Claude" come out right.
-  return word.split(/([-'])/).map(seg => {
-    if (seg === '-' || seg === "'") return seg;
+  // "O'Brien" and "jean-claude" -> "Jean-Claude" come out right. A short
+  // ending after an apostrophe stays lowercase: "Israel's", "don't",
+  // "we'll". It used to come out "Israel'S". (v1.3.3)
+  const parts = word.split(/([-'’])/);
+  return parts.map((seg, i) => {
+    if (seg === '-' || seg === "'" || seg === '’') return seg;
     if (seg.length === 0) return seg;
+    const afterApostrophe = i > 0 && (parts[i - 1] === "'" || parts[i - 1] === '’');
+    if (afterApostrophe && seg.length <= 2) return seg.toLowerCase();
     return seg.charAt(0).toUpperCase() + seg.slice(1).toLowerCase();
   }).join('');
 }
@@ -585,6 +661,72 @@ function versoNameCase(str) {
 // Distribute a page range evenly across a list of dates.
 // Returns an array of { scheduledDate, pagesStart, pagesEnd } objects.
 // The last entry absorbs any remainder so every page is accounted for.
+// ─── Import from a note (v1.4.0, logic-notes #8) ────────────────────────────
+
+// Frontmatter value for a property name, ignoring case. An exact match wins.
+function versoFrontmatterValue(frontmatter, name) {
+  if (!frontmatter || !name) return undefined;
+  const wanted = String(name).trim();
+  if (Object.prototype.hasOwnProperty.call(frontmatter, wanted)) return frontmatter[wanted];
+  const lower = wanted.toLowerCase();
+  const key = Object.keys(frontmatter).find(k => k.trim().toLowerCase() === lower);
+  return key === undefined ? undefined : frontmatter[key];
+}
+
+// "[[Adela Yarbro Collins]]" or "[[People/Collins|Collins]]" -> plain text.
+function versoStripWikilink(text) {
+  return String(text).replace(/\[\[([^\]|]*)(?:\|([^\]]*))?\]\]/g,
+    (_, target, alias) => (alias || target.split('/').pop())).trim();
+}
+
+// Reads title, author and total pages from a note's frontmatter, using the
+// property names in settings. A one-time copy: nothing links back to the note.
+// Page counts may arrive as numbers or as text ("256"); 0 or anything
+// non-numeric counts as missing.
+function versoBookFromFrontmatter(frontmatter, settings) {
+  const titleRaw = versoFrontmatterValue(frontmatter, settings.importTitleProperty || 'title');
+  const authorRaw = versoFrontmatterValue(frontmatter, settings.importAuthorProperty || 'author');
+  const pagesRaw = versoFrontmatterValue(frontmatter, settings.importPagesProperty || 'pages');
+
+  const text = v => (v === null || v === undefined) ? '' : versoStripWikilink(v);
+
+  const title = Array.isArray(titleRaw) ? text(titleRaw[0]) : text(titleRaw);
+
+  const author = Array.isArray(authorRaw)
+    ? authorRaw.map(text).filter(Boolean).join(', ')
+    : text(authorRaw);
+
+  let totalPages = null;
+  if (typeof pagesRaw === 'number') {
+    totalPages = Math.floor(pagesRaw);
+  } else if (typeof pagesRaw === 'string' && /^\s*\d[\d,]*\s*$/.test(pagesRaw)) {
+    totalPages = parseInt(pagesRaw.replace(/,/g, ''), 10);
+  }
+  if (!(totalPages > 0)) totalPages = null;
+
+  return { title, author, totalPages };
+}
+
+class VersoNotePickerModal extends FuzzySuggestModal {
+  constructor(app, onChoose) {
+    super(app);
+    this.onChoose = onChoose;
+    this.setPlaceholder('Choose a note to fill in the book details');
+  }
+
+  getItems() {
+    return this.app.vault.getMarkdownFiles();
+  }
+
+  getItemText(file) {
+    return file.path.replace(/\.md$/, '');
+  }
+
+  onChooseItem(file) {
+    this.onChoose(file);
+  }
+}
+
 function distributePages(firstPage, totalPages, dates) {
   if (dates.length === 0) return [];
 
@@ -705,6 +847,311 @@ function versoChunkSetsEqual(a, b) {
     }
     return true;
   });
+}
+
+// ─── Sync merge (v1.3.3) ─────────────────────────────────────────────────────
+//
+// Everything Verso knows lives in one data.json. A sync tool can't merge two
+// versions of one file: when two devices both saved, one copy won whole and
+// the other's changes were lost. A device that hadn't received the other's
+// latest file yet could also bring deleted books back. (Syncthing keeps the
+// losing copy as data.sync-conflict-*.json.)
+//
+// Verso now merges two copies record by record:
+//  - Books and collections: the copy changed most recently wins. Each record
+//    carries a `modified` stamp, set by saveSettings when its contents change.
+//  - Deleting a book or collection leaves a tombstone in `deletedIds`, so an
+//    older copy can't bring it back. Unmarking a reading leaves one too.
+//  - Completed readings from both copies are kept. Two that overlap in pages
+//    (each device logged the same pages without knowing about the other)
+//    become one reading covering both ranges. Upcoming and missed readings
+//    are rebuilt afterwards by recalculateSchedule.
+//  - Each completed reading keeps exactly one session.
+//  - Other settings come from whichever copy changed them last.
+
+// Top-level keys that aren't plain settings: merged by their own rules, and
+// left out of the settings comparison.
+const VERSO_MERGED_KEYS = new Set([
+  'collections', 'books', 'chunks', 'sessions', 'quotesShown', 'deletedIds', 'settingsModified'
+]);
+
+// How long a tombstone is kept. A device that has been away longer than
+// this could bring a deleted book back.
+const VERSO_TOMBSTONE_DAYS = 180;
+
+function versoRecordKey(rec) {
+  const { modified, ...rest } = rec;
+  return JSON.stringify(rest);
+}
+
+function versoSettingsKey(settings) {
+  const out = {};
+  Object.keys(settings).sort().forEach(k => {
+    if (!VERSO_MERGED_KEYS.has(k)) out[k] = settings[k];
+  });
+  return JSON.stringify(out);
+}
+
+// What data.json held at the last load or save, used to tell which records
+// this device has changed since.
+function versoSnapshot(settings) {
+  return {
+    books: new Map((settings.books || []).map(b => [b.id, versoRecordKey(b)])),
+    collections: new Map((settings.collections || []).map(c => [c.id, versoRecordKey(c)])),
+    settingsKey: versoSettingsKey(settings)
+  };
+}
+
+// Stamp books and collections changed since the snapshot, tombstone the
+// ones removed, and stamp settings if any changed. Drops expired tombstones.
+function versoStampChanges(settings, snapshot, nowIso) {
+  if (!settings.deletedIds || typeof settings.deletedIds !== 'object') settings.deletedIds = {};
+  if (!snapshot) return;
+  ['books', 'collections'].forEach(kind => {
+    const before = snapshot[kind];
+    const present = new Set();
+    (settings[kind] || []).forEach(rec => {
+      present.add(rec.id);
+      if (before.get(rec.id) !== versoRecordKey(rec)) rec.modified = nowIso;
+    });
+    before.forEach((_, id) => {
+      if (!present.has(id)) settings.deletedIds[id] = nowIso;
+    });
+  });
+  if (snapshot.settingsKey !== versoSettingsKey(settings)) settings.settingsModified = nowIso;
+
+  const cutoff = new Date(Date.now() - VERSO_TOMBSTONE_DAYS * 86400000).toISOString();
+  Object.keys(settings.deletedIds).forEach(id => {
+    if (settings.deletedIds[id] < cutoff) delete settings.deletedIds[id];
+  });
+}
+
+// The latest moment anything in this copy changed. Breaks ties between
+// records that carry no stamps (data saved before v1.3.3).
+function versoFreshness(data) {
+  let latest = data.settingsModified || '';
+  const bump = v => { if (v && v > latest) latest = v; };
+  (data.books || []).forEach(b => bump(b.modified));
+  (data.collections || []).forEach(c => bump(c.modified));
+  (data.chunks || []).forEach(c => bump(c.dateCompleted));
+  (data.sessions || []).forEach(s => bump(s.dateCompleted));
+  Object.values(data.deletedIds || {}).forEach(bump);
+  return latest;
+}
+
+function versoRangesOverlap(a, b) {
+  return a.pagesStart <= b.pagesEnd && b.pagesStart <= a.pagesEnd;
+}
+
+// Merge two copies of Verso's data. `local` is what this device has;
+// `other` is the copy from disk or a conflict file. Returns a new data
+// object; records taken unchanged keep their identity.
+function versoMergeData(local, other) {
+  const preferLocal = versoFreshness(local) >= versoFreshness(other);
+  const tie = (a, b) => (preferLocal ? a : b);
+
+  // Tombstones: union, keeping the later time.
+  const deletedIds = { ...(other.deletedIds || {}) };
+  Object.entries(local.deletedIds || {}).forEach(([id, t]) => {
+    if (!deletedIds[id] || t > deletedIds[id]) deletedIds[id] = t;
+  });
+  const isDeleted = rec => !!deletedIds[rec.id] && deletedIds[rec.id] >= (rec.modified || '');
+
+  // Books and collections: newer stamp wins; unstamped ties go to the
+  // fresher copy. Records removed by a tombstone are dropped. `winner`
+  // records which copy each book came from.
+  const winner = new Map();
+  const mergeRecords = (localList, otherList, track) => {
+    const L = new Map((localList || []).map(r => [r.id, r]));
+    const O = new Map((otherList || []).map(r => [r.id, r]));
+    const ids = [...L.keys(), ...[...O.keys()].filter(id => !L.has(id))];
+    const result = [];
+    ids.forEach(id => {
+      const l = L.get(id);
+      const o = O.get(id);
+      let pick;
+      let side;
+      if (l && o) {
+        const lm = l.modified || '';
+        const om = o.modified || '';
+        if (lm !== om) side = lm > om ? 'local' : 'other';
+        else if (versoRecordKey(l) === versoRecordKey(o)) side = 'local';
+        else side = preferLocal ? 'local' : 'other';
+        pick = side === 'local' ? l : o;
+      } else {
+        pick = l || o;
+        side = l ? 'local' : 'other';
+      }
+      if (isDeleted(pick)) return;
+      if (track) winner.set(id, side);
+      result.push(pick);
+    });
+    return result;
+  };
+
+  const books = mergeRecords(local.books, other.books, true);
+  const bookById = new Map(books.map(b => [b.id, b]));
+  const bookGone = bookId => !bookById.has(bookId) && !!deletedIds[bookId];
+
+  // ── Chunks ──
+  const Lc = new Map((local.chunks || []).map(c => [c.id, c]));
+  const Oc = new Map((other.chunks || []).map(c => [c.id, c]));
+  const allChunkIds = [...Lc.keys(), ...[...Oc.keys()].filter(id => !Lc.has(id))];
+  // A completion counts unless a later unmark tombstoned it.
+  const counts = c => !!c && c.status === 'complete' &&
+    !(deletedIds[c.id] && deletedIds[c.id] > (c.dateCompleted || ''));
+
+  const complete = [];     // { chunk, side: 'local' | 'other' | 'both' }
+  const completeIds = new Set();
+  allChunkIds.forEach(id => {
+    const l = Lc.get(id);
+    const o = Oc.get(id);
+    const lOk = counts(l);
+    const oOk = counts(o);
+    if (!lOk && !oOk) return;
+    let chunk;
+    let side;
+    if (lOk && oOk) {
+      const same = JSON.stringify(l) === JSON.stringify(o);
+      if (same) { chunk = l; side = 'both'; }
+      else if ((l.dateCompleted || '') >= (o.dateCompleted || '')) { chunk = l; side = 'local'; }
+      else { chunk = o; side = 'other'; }
+    } else {
+      chunk = lOk ? l : o;
+      side = lOk ? 'local' : 'other';
+    }
+    if (bookGone(chunk.bookId)) return;
+    complete.push({ chunk, side });
+    completeIds.add(id);
+  });
+
+  // Overlapping completed readings that came from different copies become
+  // one: the later one, widened to cover both ranges.
+  const droppedChunkIds = new Set();
+  const widened = new Map();   // chunkId -> widened copy
+  const byBook = new Map();
+  complete.forEach(entry => {
+    if (!byBook.has(entry.chunk.bookId)) byBook.set(entry.chunk.bookId, []);
+    byBook.get(entry.chunk.bookId).push(entry);
+  });
+  byBook.forEach(entries => {
+    entries.sort((a, b) => (b.chunk.dateCompleted || '').localeCompare(a.chunk.dateCompleted || ''));
+    const kept = [];
+    entries.forEach(entry => {
+      const target = entry.side === 'both' ? null : kept.find(k =>
+        k.side !== 'both' && k.side !== entry.side && versoRangesOverlap(k.chunk, entry.chunk)
+      );
+      if (!target) { kept.push(entry); return; }
+      if (!widened.has(target.chunk.id)) {
+        target.chunk = { ...target.chunk };
+        widened.set(target.chunk.id, target.chunk);
+      }
+      target.chunk.pagesStart = Math.min(target.chunk.pagesStart, entry.chunk.pagesStart);
+      target.chunk.pagesEnd = Math.max(target.chunk.pagesEnd, entry.chunk.pagesEnd);
+      droppedChunkIds.add(entry.chunk.id);
+    });
+  });
+  widened.forEach(c => {
+    c.label = buildChunkLabel(c.pagesStart, c.pagesEnd, bookById.get(c.bookId));
+  });
+
+  const chunks = [];
+  const finalComplete = new Map();
+  complete.forEach(({ chunk }) => {
+    if (droppedChunkIds.has(chunk.id)) return;
+    const c = widened.get(chunk.id) || chunk;
+    finalComplete.set(c.id, c);
+    chunks.push(c);
+  });
+
+  // Upcoming and missed readings come from whichever copy's book record won
+  // (they're rebuilt by recalculation anyway). Chunks of a book neither copy
+  // knows about are kept from either side.
+  allChunkIds.forEach(id => {
+    if (completeIds.has(id)) return;
+    const l = Lc.get(id);
+    const o = Oc.get(id);
+    const bookId = (l || o).bookId;
+    if (bookGone(bookId)) return;
+    let source;
+    if (bookById.has(bookId)) source = winner.get(bookId) === 'local' ? l : o;
+    else source = l || o;
+    if (!source || source.status === 'complete') return;
+    chunks.push(source);
+  });
+
+  // ── Sessions ──
+  const Ls = new Map((local.sessions || []).map(s => [s.id, s]));
+  const Os = new Map((other.sessions || []).map(s => [s.id, s]));
+  const allSessions = [...Ls.values(), ...[...Os.values()].filter(s => !Ls.has(s.id))];
+  const chunkIdsKnown = new Set(allChunkIds);
+  const byChunk = new Map();
+  const sessions = [];
+  allSessions.forEach(s => {
+    if (bookGone(s.bookId)) return;
+    if (droppedChunkIds.has(s.chunkId)) return;
+    if (!chunkIdsKnown.has(s.chunkId)) { sessions.push(s); return; }  // older data
+    if (!finalComplete.has(s.chunkId)) return;                         // unmarked
+    if (!byChunk.has(s.chunkId)) byChunk.set(s.chunkId, []);
+    byChunk.get(s.chunkId).push(s);
+  });
+  byChunk.forEach((group, chunkId) => {
+    const chunk = finalComplete.get(chunkId);
+    let keep = group;
+    const allShared = group.every(s => Ls.has(s.id) && Os.has(s.id));
+    if (group.length > 1 && !allShared) {
+      const match = group.find(s => s.dateCompleted === chunk.dateCompleted);
+      const latest = group.reduce((a, b) => ((b.dateCompleted || '') > (a.dateCompleted || '') ? b : a));
+      keep = [match || latest];
+    }
+    keep.forEach(s => {
+      if (widened.has(chunkId)) {
+        sessions.push({ ...s, pagesRead: chunk.pagesEnd - chunk.pagesStart + 1 });
+      } else {
+        sessions.push(s);
+      }
+    });
+  });
+
+  // ── Collections ──
+  // Book lists follow each book's own collectionId, so moving a book on one
+  // device isn't undone by the other copy's list.
+  const collections = mergeRecords(local.collections, other.collections, false).map(coll => {
+    const list = (coll.books || []).filter(id => {
+      if (deletedIds[id] && !bookById.has(id)) return false;
+      const b = bookById.get(id);
+      return !b || b.collectionId === coll.id;
+    });
+    books.forEach(b => {
+      if (b.collectionId === coll.id && !list.includes(b.id)) list.push(b.id);
+    });
+    const same = list.length === (coll.books || []).length &&
+      list.every((id, i) => id === coll.books[i]);
+    return same ? coll : { ...coll, books: list };
+  });
+
+  // ── Settings and quotes ──
+  const lsm = local.settingsModified || '';
+  const osm = other.settingsModified || '';
+  const settingsFrom = lsm !== osm ? (lsm > osm ? local : other) : tie(local, other);
+  const merged = {};
+  Object.keys(settingsFrom).forEach(k => {
+    if (!VERSO_MERGED_KEYS.has(k)) merged[k] = settingsFrom[k];
+  });
+  if (settingsFrom.settingsModified) merged.settingsModified = settingsFrom.settingsModified;
+
+  const quotes = [...(local.quotesShown || [])];
+  (other.quotesShown || []).forEach(q => { if (!quotes.includes(q)) quotes.push(q); });
+
+  return {
+    ...merged,
+    collections,
+    books,
+    chunks,
+    sessions,
+    quotesShown: quotes,
+    deletedIds
+  };
 }
 
 // Returns the updated full list of chunks for this book (complete + missed + upcoming).
@@ -938,8 +1385,20 @@ class VersoPlugin extends Plugin {
     console.log(`Verso v${this.manifest.version} loading...`);
     await this.loadSettings();
 
+    // Merge any copy a sync tool set aside while Verso was closed (v1.3.3).
+    this.externalCheckInProgress = true;
+    try {
+      await this.mergeConflictFiles();
+    } catch (e) {
+      console.error('Verso: could not merge sync conflict files.', e);
+    } finally {
+      this.externalCheckInProgress = false;
+    }
+
     // Catch up any missed reading days and redistribute schedules
     await this.recalculateAllBooks();
+
+    this.setupStatusBar();
 
     // ...and do it again whenever the calendar day changes while Obsidian
     // stays open (see checkDayRollover).
@@ -1014,6 +1473,14 @@ class VersoPlugin extends Plugin {
     });
 
     this.addSettingTab(new VersoSettingTab(this.app, this));
+
+    this.addCommand({
+      id: 'verso-add-days-off',
+      name: 'Add days off',
+      callback: () => {
+        new VersoDaysOffModal(this.app, this, null, () => {}).open();
+      }
+    });
 
     this.addCommand({
       id: 'verso-add-book',
@@ -1202,12 +1669,23 @@ class VersoPlugin extends Plugin {
     this.settings.quotesShown = Array.isArray(this.settings.quotesShown)
       ? [...this.settings.quotesShown]
       : [];
+    this.settings.daysOff = Array.isArray(this.settings.daysOff)
+      ? [...this.settings.daysOff]
+      : [];
 
     this.settings.books.forEach(book => {
       if (!book.originalTargetFinishDate) {
         book.originalTargetFinishDate = book.targetFinishDate;
       }
     });
+
+    // Sync merge bookkeeping (v1.3.3): tombstones, and what the file held
+    // as loaded, so the next save can tell what this device changed.
+    if (!this.settings.deletedIds || typeof this.settings.deletedIds !== 'object') {
+      this.settings.deletedIds = {};
+    }
+    this.syncSnapshot = versoSnapshot(this.settings);
+    await this.rememberDataMtime();
   }
 
   async saveSettings() {
@@ -1216,11 +1694,126 @@ class VersoPlugin extends Plugin {
     // mistake it for a sync write. saveDepth tells it to wait.
     this.saveDepth = (this.saveDepth || 0) + 1;
     try {
+      versoStampChanges(this.settings, this.syncSnapshot, new Date().toISOString());
+      const merged = await this.mergeDiskBeforeSave();
       await this.saveData(this.settings);
+      this.syncSnapshot = versoSnapshot(this.settings);
       await this.rememberDataMtime();
+      if (merged) this.refreshAllViews();
+      this.updateStatusBar();
     } finally {
       this.saveDepth--;
     }
+  }
+
+  // ── Status bar (v1.4.0) ─────────────────────────────────────
+  //
+  // "12 pages left today". Desktop only: phones have no status bar. Hidden
+  // when nothing is left. Same count as the dashboard's "Pages today".
+  // Updated after every save and view refresh, which covers checking off a
+  // reading and the day rolling over. Click opens the dashboard.
+  setupStatusBar() {
+    if (Platform && Platform.isMobile) return;
+    this.statusBarEl = this.addStatusBarItem();
+    this.statusBarEl.addClass('verso-status-bar');
+    this.statusBarEl.addClass('mod-clickable');
+    this.statusBarEl.setAttribute('aria-label', 'Open Verso dashboard');
+    this.registerDomEvent(this.statusBarEl, 'click', () => this.activateDashboardView());
+    this.updateStatusBar();
+  }
+
+  pagesLeftToday() {
+    return this.getTodaysChunks().reduce((sum, c) => sum + (c.pagesEnd - c.pagesStart + 1), 0);
+  }
+
+  updateStatusBar() {
+    if (!this.statusBarEl) return;
+    const n = this.pagesLeftToday();
+    this.statusBarEl.setText(n > 0 ? `${n} page${n === 1 ? '' : 's'} left today` : '');
+    this.statusBarEl.style.display = n > 0 ? '' : 'none';
+  }
+
+  // If a sync tool replaced data.json since Verso last read or wrote it,
+  // merge that copy in before writing, instead of overwriting it. Returns
+  // true if a merge happened. (v1.3.3)
+  async mergeDiskBeforeSave() {
+    if (this.lastDataMtime == null) return false;
+    const adapter = this.app.vault.adapter;
+    let disk;
+    try {
+      const stat = await adapter.stat(this.dataFilePath());
+      if (!stat || stat.mtime === this.lastDataMtime) return false;
+      disk = JSON.parse(await adapter.read(this.dataFilePath()));
+    } catch (e) {
+      console.error('Verso: could not read data.json to merge before saving.', e);
+      return false;
+    }
+    this.settings = versoMergeData(this.settings, Object.assign({}, DEFAULT_SETTINGS, disk));
+    this.recalculateActiveBooksInMemory();
+    return true;
+  }
+
+  recalculateActiveBooksInMemory() {
+    this.settings.books
+      .filter(b => b.status !== 'complete' && b.status !== 'archived' && b.status !== 'planned')
+      .forEach(b => this.recalculateBookInMemory(b.id));
+  }
+
+  // Sync tools keep the losing copy when two devices both changed
+  // data.json, e.g. Syncthing's data.sync-conflict-*.json or Dropbox's
+  // "data (conflicted copy).json". Merge each into Verso's data, then move
+  // it into merged-conflicts/ so it's handled once. Returns true if any
+  // were merged. (v1.3.3)
+  async mergeConflictFiles() {
+    const adapter = this.app.vault.adapter;
+    const dir = this.manifest.dir;
+    let files;
+    try {
+      files = (await adapter.list(dir)).files;
+    } catch (e) {
+      return false;
+    }
+    const conflicts = files.filter(f => {
+      const name = f.split('/').pop();
+      return name !== 'data.json' && /^data\b.*conflict.*\.json$/i.test(name);
+    });
+    if (conflicts.length === 0) return false;
+
+    const archiveDir = `${dir}/merged-conflicts`;
+    let mergedAny = false;
+    for (const file of conflicts) {
+      let copy;
+      try {
+        copy = JSON.parse(await adapter.read(file));
+      } catch (e) {
+        console.error(`Verso: could not read ${file}; leaving it in place.`, e);
+        continue;
+      }
+      this.settings = versoMergeData(this.settings, Object.assign({}, DEFAULT_SETTINGS, copy));
+      mergedAny = true;
+      try {
+        if (!(await adapter.exists(archiveDir))) await adapter.mkdir(archiveDir);
+        await adapter.rename(file, `${archiveDir}/${file.split('/').pop()}`);
+      } catch (e) {
+        // Leaving it in place only means it's merged again next time,
+        // which changes nothing.
+        console.error(`Verso: merged ${file} but could not move it.`, e);
+      }
+    }
+    if (!mergedAny) return false;
+
+    // Merged records keep the stamps they came with, rather than counting
+    // as changed on this device.
+    this.syncSnapshot = versoSnapshot(this.settings);
+    this.recalculateActiveBooksInMemory();
+    for (const book of this.settings.books.filter(b => b.status === 'active')) {
+      const finished = this.lastChunkCompletionDate(book.id);
+      if (finished) await this.checkBookCompletion(book.id, finished);
+    }
+    await this.saveSettings();
+    this.refreshAllViews();
+    new Notice('Verso merged reading changes from another device.');
+    return true;
   }
 
   // ── External changes to data.json (sync) ────────────────────
@@ -1245,8 +1838,8 @@ class VersoPlugin extends Plugin {
     this.externalCheckInProgress = true;
     try {
       const stat = await this.app.vault.adapter.stat(this.dataFilePath());
-      if (!stat || stat.mtime === this.lastDataMtime) return;
-      await this.reloadFromDisk();
+      if (stat && stat.mtime !== this.lastDataMtime) await this.reloadFromDisk();
+      await this.mergeConflictFiles();
     } catch (e) {
       console.error('Verso: could not check data.json for outside changes.', e);
     } finally {
@@ -1557,10 +2150,105 @@ class VersoPlugin extends Plugin {
   }
 
   // Get the effective reading-days setting for a book (its override, or the global default)
+  // Includes days off (all-book and this book's) when any are set.
   getReadingDaysFor(book) {
-    return book.readingDaysOverride || this.settings.readingDays === 'custom'
+    const weekly = book.readingDaysOverride || this.settings.readingDays === 'custom'
       ? (book.readingDaysOverride || this.settings.customReadingDays)
       : this.settings.readingDays;
+    return versoWithDaysOff(weekly, [...(this.settings.daysOff || []), ...(book.daysOff || [])]);
+  }
+
+  // ── Days off (v1.4.0) ───────────────────────────────────────
+
+  // Active books a days-off range would apply to: one book, or all.
+  daysOffBooks(bookId) {
+    return this.settings.books.filter(b => b.status === 'active' && (!bookId || b.id === bookId));
+  }
+
+  // What adding a range would do to each affected book, without changing
+  // anything: [{ book, lost, noneLeft, newFinish, paceBefore, paceAfter }].
+  // noneLeft: the range covers every reading day left before the finish
+  // date. Keeping that date would leave the book off pace, with all its
+  // upcoming readings frozen as missed, so its finish date has to move.
+  previewDaysOff(range, bookId) {
+    return this.daysOffBooks(bookId).map(book => {
+      const before = this.getReadingDaysFor(book);
+      const after = versoWithDaysOff(before.weekly !== undefined ? before.weekly : before,
+        [...(before.off || []), range]);
+      const progress = this.getBookProgress(book.id);
+      const pagesRead = progress ? progress.pagesRead : 0;
+      const lost = versoReadingDaysLost(book, before, after);
+      return {
+        book,
+        lost,
+        noneLeft: lost > 0 && versoReadingDaysLeft(book, after) <= 0,
+        newFinish: versoFinishDateAfterDaysOff(book, before, after),
+        paceBefore: calculatePaceNeeded(book.totalPages, pagesRead, book.targetFinishDate, before),
+        paceAfter: calculatePaceNeeded(book.totalPages, pagesRead, book.targetFinishDate, after)
+      };
+    });
+  }
+
+  // Adds a days-off range for one book (bookId) or all books (null). With
+  // moveFinishDates, each book that loses reading days gets a later finish
+  // date that gives them back; otherwise the pages are spread over the
+  // reading days that remain. A book left with no reading days at all
+  // (noneLeft) has its finish date moved either way.
+  //
+  // The finish date is set directly, not through updateBookDates(). That
+  // function checks for off pace against the book's reading days, which by
+  // then include the new range: a book the range would leave with no days
+  // looked off pace, the new date seemed to rescue it, and it was stamped
+  // reactivatedDate, which stops earlier missed readings from counting.
+  // Days off never start a new attempt. (v1.4.0)
+  async addDaysOff({ start, end, label }, bookId, moveFinishDates) {
+    const range = { id: generateId(), start, end, label: (label || '').trim() };
+    const plan = this.previewDaysOff(range, bookId)
+      .filter(p => moveFinishDates || p.noneLeft);
+
+    if (bookId) {
+      const book = this.getBook(bookId);
+      if (!book) return;
+      const i = this.settings.books.indexOf(book);
+      this.settings.books[i] = { ...book, daysOff: [...(book.daysOff || []), range] };
+    } else {
+      this.settings.daysOff = [...(this.settings.daysOff || []), range];
+    }
+
+    for (const p of plan) {
+      if (p.newFinish && p.newFinish !== p.book.targetFinishDate) {
+        const i = this.settings.books.findIndex(b => b.id === p.book.id);
+        if (i !== -1) this.settings.books[i] = { ...this.settings.books[i], targetFinishDate: p.newFinish };
+      }
+    }
+    this.daysOffBooks(bookId).forEach(b => this.recalculateBookInMemory(b.id));
+    await this.saveSettings();
+    this.refreshAllViews();
+  }
+
+  // Removes a range wherever it is. Finish dates aren't moved back.
+  async removeDaysOff(id) {
+    this.settings.daysOff = (this.settings.daysOff || []).filter(r => r.id !== id);
+    this.settings.books = this.settings.books.map(b =>
+      (b.daysOff || []).some(r => r.id === id)
+        ? { ...b, daysOff: b.daysOff.filter(r => r.id !== id) }
+        : b
+    );
+    await this.recalculateAllBooks();
+    await this.saveSettings();
+    this.refreshAllViews();
+  }
+
+  // Every range that hasn't ended yet, with the book it belongs to (null =
+  // all books), soonest first.
+  upcomingDaysOff(bookId) {
+    const today = versoToday();
+    const list = [];
+    (this.settings.daysOff || []).forEach(r => list.push({ range: r, book: null }));
+    this.settings.books.forEach(b => (b.daysOff || []).forEach(r => list.push({ range: r, book: b })));
+    return list
+      .filter(x => x.range.end >= today && (!bookId || !x.book || x.book.id === bookId))
+      .sort((a, b) => a.range.start.localeCompare(b.range.start));
   }
 
   // Build and store the initial schedule for a book that has no chunks yet
@@ -1602,7 +2290,8 @@ class VersoPlugin extends Plugin {
     // A day selection with no days at all would make the book look
     // off-pace and permanently freeze its upcoming chunks as 'missed'.
     // Leave the schedule alone until a real selection exists.
-    if (typeof readingDays === 'object' && !Object.values(readingDays).some(v => v === true)) {
+    const weekly = versoWeeklyDays(readingDays);
+    if (typeof weekly === 'object' && !Object.values(weekly).some(v => v === true)) {
       return false;
     }
 
@@ -1667,6 +2356,7 @@ class VersoPlugin extends Plugin {
   // Called after any change that affects more than the view it came from:
   // archive, restore, delete, Start reading, edits, adds. (v1.3.2)
   refreshAllViews() {
+    this.updateStatusBar();
     [VIEW_TYPE_VERSO_DASHBOARD, VIEW_TYPE_VERSO_TODAY, VIEW_TYPE_VERSO_BOOK, VIEW_TYPE_VERSO_LIBRARY]
       .forEach(type => {
         this.app.workspace.getLeavesOfType(type).forEach(leaf => {
@@ -1805,6 +2495,50 @@ async markChunkComplete(chunkId, actualEnd = null) {
     return { chunk, bookJustCompleted };
   }
 
+  // ── Log reading on a day with nothing scheduled (v1.4.0) ────
+  //
+  // A day off, or a day outside the book's reading days, has no reading to
+  // check off. "Log reading" on the dashboard card records one anyway:
+  // a reading dated today that starts at the next unread page, pre-filled
+  // to the end of the next scheduled reading. recalculateSchedule keeps
+  // completed readings on any date, counts their pages as read and treats
+  // today as used, so the remaining pages are simply spread over the
+  // remaining reading days. Finish dates and days off don't change.
+  //
+  // extraReadingFor() only builds the reading; nothing is stored until
+  // logExtraReading() is called with the page the reader reached.
+  // Returns null when the book has nothing left to read.
+  extraReadingFor(bookId) {
+    const book = this.getBook(bookId);
+    if (!book || book.status !== 'active') return null;
+    const chunks = this.getChunksForBook(bookId);
+    const pagesRead = chunks
+      .filter(c => c.status === 'complete')
+      .reduce((sum, c) => sum + (c.pagesEnd - c.pagesStart + 1), 0);
+    if (pagesRead >= book.totalPages) return null;
+    const pagesStart = pagesRead + 1;
+    const next = chunks.find(c => c.status === 'upcoming');
+    const pagesEnd = Math.min(book.totalPages,
+      Math.max(pagesStart, next ? next.pagesEnd : book.totalPages));
+    return {
+      bookId,
+      label: buildChunkLabel(pagesStart, pagesEnd, book),
+      pagesStart,
+      pagesEnd,
+      scheduledDate: versoToday(),
+      status: 'upcoming'
+    };
+  }
+
+  // Stores a reading from extraReadingFor() and marks it read up to
+  // actualEnd. `extra: true` tells it apart from a scheduled reading, for
+  // future reading stats. Same result shape as markChunkComplete().
+  async logExtraReading(reading, actualEnd) {
+    const chunk = { ...createChunk(reading), extra: true };
+    this.settings.chunks.push(chunk);
+    return this.markChunkComplete(chunk.id, actualEnd);
+  }
+
   // Reverse an accidental completion: restores the chunk to 'upcoming',
   // removes its session, and un-completes the book if this was its final
   // chunk.
@@ -1816,6 +2550,11 @@ async markChunkComplete(chunkId, actualEnd = null) {
 
     chunk.status = 'upcoming';
     chunk.dateCompleted = null;
+
+    // Tombstone the completion so another device's older copy can't bring
+    // it back in a sync merge (v1.3.3).
+    if (!this.settings.deletedIds) this.settings.deletedIds = {};
+    this.settings.deletedIds[chunkId] = new Date().toISOString();
 
     // Remove the session created when this chunk was completed
     this.settings.sessions = this.settings.sessions.filter(s => s.chunkId !== chunkId);
@@ -2129,11 +2868,27 @@ class VersoDashboardView extends ItemView {
       new AddBookModal(this.app, this.plugin, () => this.render()).open();
     });
 
+    const daysOffLink = actions.createEl('a', { text: 'Days off', cls: 'verso-book-back-link' });
+    daysOffLink.addEventListener('click', (e) => {
+      e.preventDefault();
+      new VersoDaysOffListModal(this.app, this.plugin, () => this.render()).open();
+    });
+
     const libraryLink = actions.createEl('a', { text: 'Library →', cls: 'verso-book-back-link' });
     libraryLink.addEventListener('click', (e) => {
       e.preventDefault();
       this.plugin.activateLibraryView();
     });
+
+    // Upcoming days off stay in view so they aren't forgotten. (v1.4.0)
+    const upcoming = this.plugin.upcomingDaysOff(null);
+    if (upcoming.length) {
+      const line = container.createDiv({ cls: 'verso-dashboard-days-off' });
+      line.setText('Days off: ' + upcoming.map(({ range, book }) =>
+        versoDescribeDaysOff(range) + (book ? ` (${book.title})` : '')).join('; '));
+      line.addEventListener('click', () =>
+        new VersoDaysOffListModal(this.app, this.plugin, () => this.render()).open());
+    }
   }
 
   // Status priority for dashboard ordering: most-needs-attention first.
@@ -2280,6 +3035,35 @@ class VersoDashboardView extends ItemView {
       const today = versoToday();
       const onTrackNothingDueToday =
         progress.status === 'on-track' && progress.nextDueDate && progress.nextDueDate !== today;
+
+      // No reading today: say why, so a missing checkbox isn't a mystery.
+      // (v1.4.0)
+      if (chunksForBook.length === 0 && progress.status !== 'not-started' && progress.status !== 'off-pace') {
+        let note = versoNoReadingTodayReason(this.plugin.getReadingDaysFor(book), new Date());
+        if (progress.nextDueDate && !onTrackNothingDueToday) {
+          note += ` · next reading ${this.formatDate(progress.nextDueDate)}`;
+        }
+        const noteEl = info.createDiv({ text: note, cls: 'verso-progress-no-reading' });
+
+        // Read anyway: log pages on a day with nothing scheduled. (v1.4.0)
+        const reading = this.plugin.extraReadingFor(book.id);
+        if (reading) {
+          noteEl.appendText(' · ');
+          const logLink = noteEl.createEl('a', { text: 'Log reading', cls: 'verso-log-reading-link' });
+          logLink.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            new VersoPagesReadModal(this.app, this.plugin, reading, book, async (actualEnd) => {
+              const { bookJustCompleted } = await this.plugin.logExtraReading(reading, actualEnd);
+              this.refreshAfterChunkUpdate();
+              if (bookJustCompleted) {
+                new VersoBookCompleteModal(this.app, this.plugin, book.id).open();
+              }
+              return { bookJustCompleted };
+            }, { extra: true }).open();
+          });
+        }
+      }
 
       const badge = header.createDiv({ cls: `verso-badge ${this.badgeClassForStatus(progress.status)}` });
       badge.setText(
@@ -2752,6 +3536,10 @@ class VersoBookView extends ItemView {
     versoAddSummaryRow(table, 'Start date', versoFormatDate(book.startDate));
     versoAddSummaryRow(table, 'Finish by', versoFormatDate(book.targetFinishDate));
     versoAddSummaryRow(table, 'Reading days', this.describeReadingDays(book));
+    const daysOff = this.plugin.upcomingDaysOff(book.id);
+    if (daysOff.length) {
+      versoAddSummaryRow(table, 'Days off', daysOff.map(x => versoDescribeDaysOff(x.range)).join('; '));
+    }
 
     this.renderActions(container, book);
   }
@@ -2833,6 +3621,16 @@ class VersoBookView extends ItemView {
       });
     }
 
+    if (book.status === 'active') {
+      const daysOffBtn = actions.createEl('button', {
+        text: 'Add days off',
+        cls: 'verso-btn verso-btn-secondary'
+      });
+      daysOffBtn.addEventListener('click', () => {
+        new VersoDaysOffModal(this.app, this.plugin, book.id, () => this.render()).open();
+      });
+    }
+
     const archiveBtn = actions.createEl('button', {
       text: 'Archive this book',
       cls: 'verso-btn verso-btn-secondary'
@@ -2863,7 +3661,7 @@ class VersoBookView extends ItemView {
   }
 
   describeReadingDays(book) {
-    const days = this.plugin.getReadingDaysFor(book);
+    const days = versoWeeklyDays(this.plugin.getReadingDaysFor(book));
     if (days === 'everyday') return 'Every day';
     if (days === 'weekdays') return 'Weekdays';
     if (typeof days === 'object') {
@@ -3413,6 +4211,280 @@ class VersoArchiveModal extends Modal {
 }
 
 
+// ─── Days Off Modal (v1.4.0) ─────────────────────────────────────────────────
+//
+// Adds a days-off range for one book or all books, and asks whether finish
+// dates should move. Shows what each choice does to every affected book.
+
+function versoDescribeDaysOff(range) {
+  const dates = range.start === range.end
+    ? versoFormatDate(range.start)
+    : `${versoFormatDate(range.start)} – ${versoFormatDate(range.end)}`;
+  return range.label ? `${dates} · ${range.label}` : dates;
+}
+
+// "Every day", "Weekdays", or "Mon, Wed, Fri" for a weekly pattern.
+function versoDescribeWeeklyDays(weekly) {
+  if (weekly === 'everyday') return 'every day';
+  if (weekly === 'weekdays') return 'weekdays';
+  if (weekly && typeof weekly === 'object') {
+    const labels = { sun: 'Sun', mon: 'Mon', tue: 'Tue', wed: 'Wed', thu: 'Thu', fri: 'Fri', sat: 'Sat' };
+    const active = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'].filter(k => weekly[k]);
+    if (active.length === 7) return 'every day';
+    if (active.join() === 'mon,tue,wed,thu,fri') return 'weekdays';
+    return active.map(k => labels[k]).join(', ');
+  }
+  return 'every day';
+}
+
+// All-book days off that fall inside a new schedule, and what they cost
+// it. Used by Add book and Start reading, so days off set weeks ago (and
+// forgotten) don't silently squeeze a new book into a few heavy days.
+// Returns null when no days off take a reading day; otherwise
+// { text, lost, total, left, laterFinish }, where laterFinish gives the
+// lost reading days back after the finish date. (v1.4.0)
+function versoDaysOffWarning(daysOff, weekly, startDate, finishDate) {
+  if (!startDate || !finishDate) return null;
+  const from = versoScheduleFrom(startDate);
+  if (finishDate < from) return null;
+  const ranges = (daysOff || []).filter(r => r && r.start && r.end && r.start <= finishDate && r.end >= from);
+  if (ranges.length === 0) return null;
+  const after = versoWithDaysOff(weekly, ranges);
+  const total = countReadingDays(from, finishDate, weekly);
+  const left = countReadingDays(from, finishDate, after);
+  const lost = total - left;
+  if (lost <= 0) return null;
+  const laterFinish = versoFinishDateAfterDaysOff(
+    { startDate: from, targetFinishDate: finishDate }, weekly, after);
+  const days = n => `${n} reading day${n === 1 ? '' : 's'}`;
+  const text = `Your days off (${ranges.map(versoDescribeDaysOff).join('; ')}) ` +
+    `take ${days(lost)} from this book, leaving ${left === 0 ? 'none' : days(left)}.`;
+  return { text, lost, total, left, laterFinish };
+}
+
+// Why a book has nothing to read on `date`: a day off, a day outside its
+// reading days, or simply nothing left scheduled.
+function versoNoReadingTodayReason(readingDays, date) {
+  const dateString = versoLocalDateString(date);
+  const off = (readingDays && readingDays.off || []).find(r => r.start <= dateString && dateString <= r.end);
+  if (off) return off.label ? `Day off today (${off.label})` : 'Day off today';
+  const weekly = versoWeeklyDays(readingDays);
+  if (!isDayEnabled(date.getDay(), weekly)) {
+    return `Not a reading day · reads ${versoDescribeWeeklyDays(weekly)}`;
+  }
+  return 'Nothing scheduled today';
+}
+
+// Lists the days off still to come, with remove buttons, and opens the add
+// form. Reached from the dashboard. (v1.4.0)
+class VersoDaysOffListModal extends Modal {
+  constructor(app, plugin, onDone) {
+    super(app);
+    this.plugin = plugin;
+    this.onDone = onDone || null;
+  }
+
+  onOpen() {
+    this.render();
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+
+  render() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl('h3', { text: 'Days off' });
+
+    const upcoming = this.plugin.upcomingDaysOff(null);
+    if (upcoming.length === 0) {
+      contentEl.createEl('p', { text: 'No days off coming up.', cls: 'verso-confirm-body' });
+    } else {
+      const list = contentEl.createDiv({ cls: 'verso-days-off-list' });
+      upcoming.forEach(({ range, book }) => {
+        const row = list.createDiv({ cls: 'verso-days-off-row' });
+        const info = row.createDiv({ cls: 'verso-up-next-info' });
+        info.createDiv({ text: versoDescribeDaysOff(range), cls: 'verso-up-next-title' });
+        info.createDiv({ text: book ? `Only "${book.title}"` : 'All books', cls: 'verso-up-next-meta' });
+        const removeBtn = row.createEl('button', { text: 'Remove', cls: 'verso-btn verso-btn-text' });
+        removeBtn.addEventListener('click', async () => {
+          await this.plugin.removeDaysOff(range.id);
+          this.render();
+          if (this.onDone) this.onDone();
+        });
+      });
+      contentEl.createEl('p', {
+        text: 'Removing days off spreads the pages again but doesn\'t move finish dates back.',
+        cls: 'verso-field-desc'
+      });
+    }
+
+    const buttons = contentEl.createDiv({ cls: 'verso-confirm-buttons' });
+    const closeBtn = buttons.createEl('button', { text: 'Close', cls: 'verso-btn verso-btn-text' });
+    closeBtn.addEventListener('click', () => this.close());
+    const addBtn = buttons.createEl('button', { text: 'Add days off', cls: 'verso-btn verso-btn-primary' });
+    addBtn.addEventListener('click', () => {
+      this.close();
+      new VersoDaysOffModal(this.app, this.plugin, null, this.onDone).open();
+    });
+  }
+}
+
+class VersoDaysOffModal extends Modal {
+  constructor(app, plugin, bookId, onDone) {
+    super(app);
+    this.plugin = plugin;
+    this.onDone = onDone || null;
+    this.bookId = bookId || null;      // null = all books
+    this.start = versoToday();
+    this.end = versoToday();
+    this.label = '';
+    this.moveFinishDates = null;       // must be chosen when a book loses days
+  }
+
+  onOpen() {
+    this.modalEl.addClass('verso-days-off-modal');
+    this.render();
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+
+  isValid() {
+    return !!this.start && !!this.end && this.start <= this.end;
+  }
+
+  render() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl('h3', { text: 'Add days off' });
+    contentEl.createEl('p', {
+      text: 'No reading is scheduled on these dates.',
+      cls: 'verso-confirm-body'
+    });
+
+    const form = contentEl.createDiv({ cls: 'verso-form' });
+
+    // ── Applies to ───────────────────────────────────────────────
+    const scopeField = form.createDiv({ cls: 'verso-field' });
+    scopeField.createEl('label', { text: 'Applies to', cls: 'verso-field-label' });
+    const scope = scopeField.createEl('select', { cls: 'verso-input' });
+    scope.createEl('option', { text: 'All books', value: '' });
+    this.plugin.daysOffBooks(null).forEach(b => {
+      const opt = scope.createEl('option', { text: b.title, value: b.id });
+      if (b.id === this.bookId) opt.selected = true;
+    });
+    scope.addEventListener('change', (e) => {
+      this.bookId = e.target.value || null;
+      this.render();
+    });
+
+    // ── Dates ────────────────────────────────────────────────────
+    const dateRow = form.createDiv({ cls: 'verso-days-off-dates' });
+    const makeDate = (labelText, key) => {
+      const field = dateRow.createDiv({ cls: 'verso-field' });
+      field.createEl('label', { text: labelText, cls: 'verso-field-label' });
+      const input = field.createEl('input', { type: 'date', cls: 'verso-input' });
+      input.value = this[key];
+      input.addEventListener('change', (e) => {
+        this[key] = e.target.value;
+        if (key === 'start' && this.end && this.end < this.start) this.end = this.start;
+        this.render();
+      });
+    };
+    makeDate('From', 'start');
+    makeDate('To', 'end');
+    if (this.start && this.end && this.end < this.start) {
+      form.createDiv({ cls: 'verso-field-error', text: 'The end date is before the start date.' });
+    }
+
+    // ── Label ────────────────────────────────────────────────────
+    const labelField = form.createDiv({ cls: 'verso-field' });
+    labelField.createEl('label', { text: 'Label (optional)', cls: 'verso-field-label' });
+    const labelInput = labelField.createEl('input', {
+      type: 'text', cls: 'verso-input', attr: { placeholder: 'e.g. Travel' }
+    });
+    labelInput.value = this.label;
+    labelInput.addEventListener('input', (e) => { this.label = e.target.value; });
+
+    // ── Effect and finish-date choice ────────────────────────────
+    const preview = this.isValid()
+      ? this.plugin.previewDaysOff({ start: this.start, end: this.end }, this.bookId)
+      : [];
+    const affected = preview.filter(p => p.lost > 0);
+
+    if (this.isValid()) {
+      if (affected.length === 0) {
+        form.createDiv({
+          cls: 'verso-field-desc',
+          text: this.bookId
+            ? 'This book has no reading days on these dates, so its schedule won\'t change.'
+            : 'None of your books have reading days on these dates. Books you start later will skip them.'
+        });
+      } else {
+        // Books these dates leave with no reading days must move their
+        // finish date; only the others get a choice. (v1.4.0)
+        const choosable = affected.filter(p => !p.noneLeft);
+        if (choosable.length > 0) {
+          const choiceField = form.createDiv({ cls: 'verso-field' });
+          choiceField.createEl('label', { text: 'Should finish dates change?', cls: 'verso-field-label' });
+          const choice = (value, text) => {
+            const row = choiceField.createEl('label', { cls: 'verso-toggle-label verso-days-off-choice' });
+            const radio = row.createEl('input', { type: 'radio', attr: { name: 'verso-days-off-move' } });
+            radio.checked = this.moveFinishDates === value;
+            row.createSpan({ text });
+            radio.addEventListener('change', () => { this.moveFinishDates = value; this.render(); });
+          };
+          choice(false, 'No, keep the finish dates. Read a little more on the other days.');
+          choice(true, 'Yes, move the finish dates later by the days lost.');
+        }
+
+        const list = form.createDiv({ cls: 'verso-days-off-effects' });
+        affected.forEach(p => {
+          const days = `${p.lost} reading day${p.lost === 1 ? '' : 's'}`;
+          const moves = `Finish moves from ${versoFormatDate(p.book.targetFinishDate)} to ${versoFormatDate(p.newFinish)}.`;
+          let effect = `loses ${days}`;
+          if (p.noneLeft) {
+            effect += `, all it has left before its finish date. ${moves}`;
+          } else if (this.moveFinishDates === true) {
+            effect += `. ${moves}`;
+          } else if (this.moveFinishDates === false) {
+            effect += `. About ${p.paceBefore} → ${p.paceAfter} pages a day.`;
+          } else {
+            effect += '.';
+          }
+          const row = list.createDiv({ cls: 'verso-field-desc' });
+          row.createEl('strong', { text: p.book.title });
+          row.appendText(` ${effect}`);
+        });
+      }
+    }
+
+    // ── Buttons ──────────────────────────────────────────────────
+    const buttons = contentEl.createDiv({ cls: 'verso-confirm-buttons' });
+    const cancelBtn = buttons.createEl('button', { text: 'Cancel', cls: 'verso-btn verso-btn-text' });
+    cancelBtn.addEventListener('click', () => this.close());
+
+    const saveBtn = buttons.createEl('button', { text: 'Add days off', cls: 'verso-btn verso-btn-primary' });
+    const needsChoice = affected.some(p => !p.noneLeft) && this.moveFinishDates === null;
+    saveBtn.disabled = !this.isValid() || needsChoice;
+    saveBtn.addEventListener('click', async () => {
+      if (saveBtn.disabled) return;
+      this.close();
+      await this.plugin.addDaysOff(
+        { start: this.start, end: this.end, label: this.label },
+        this.bookId,
+        this.moveFinishDates === true
+      );
+      new Notice('Days off added.');
+      if (this.onDone) this.onDone();
+    });
+  }
+}
+
+
 // ─── Activate Modal ──────────────────────────────────────────────────────────
 //
 // Promotes a planned book to active: a small, focused modal asking only for
@@ -3470,7 +4542,9 @@ class VersoActivateModal extends Modal {
       this.updateConfirmButtonState();
     });
 
+    this.finishInput = finishInput;
     this.finishErrorEl = finishField.createDiv({ cls: 'verso-field-error' });
+    this.daysOffEl = finishField.createDiv();
 
     if (this.book.targetFinishDate) {
       finishField.createEl('div', {
@@ -3526,6 +4600,30 @@ class VersoActivateModal extends Modal {
     this.confirmBtn.toggleClass('verso-btn-disabled', !valid);
     if (this.finishErrorEl) {
       this.finishErrorEl.setText(error || '');
+    }
+    this.renderDaysOffWarning(error);
+  }
+
+  // Days off reminder, as in Add book (v1.4.0).
+  renderDaysOffWarning(error) {
+    if (!this.daysOffEl) return;
+    this.daysOffEl.empty();
+    if (error) return;
+    const weekly = versoWeeklyDays(this.plugin.getReadingDaysFor(this.book));
+    const w = versoDaysOffWarning(this.plugin.settings.daysOff, weekly, this.startDate, this.targetFinishDate);
+    if (!w) return;
+    const box = this.daysOffEl.createDiv({ cls: 'verso-pace-note verso-pace-note-warning verso-days-off-warning' });
+    box.createDiv({ text: w.text });
+    if (w.laterFinish !== this.targetFinishDate) {
+      const moveBtn = box.createEl('button', {
+        text: `Finish ${versoFormatDateLong(w.laterFinish)} instead`,
+        cls: 'verso-btn verso-btn-secondary verso-days-off-warning-btn'
+      });
+      moveBtn.addEventListener('click', () => {
+        this.targetFinishDate = w.laterFinish;
+        this.finishInput.value = w.laterFinish;
+        this.updateConfirmButtonState();
+      });
     }
   }
 
@@ -4321,12 +5419,16 @@ class VersoEditBookModal extends Modal {
 // scheduledPagesEnd, recalc) happens in markChunkComplete via onConfirm —
 // wired in the next piece.
 class VersoPagesReadModal extends Modal {
-  constructor(app, plugin, chunk, book, onConfirm) {
+  // options.extra: logging a reading on a day with nothing scheduled
+  // (see extraReadingFor). Changes only the wording. (v1.4.0)
+  constructor(app, plugin, chunk, book, onConfirm, options = {}) {
     super(app);
     this.plugin = plugin;
     this.chunk = chunk;
     this.book = book;
     this.onConfirm = onConfirm || null;
+    this.extra = !!options.extra;
+    this.readingName = this.extra ? 'Your next reading' : "Today's reading";
 
     this.scheduledEnd = chunk.pagesEnd;
     this.actualEnd = chunk.pagesEnd; // pre-fill with the plan — stays the
@@ -4353,7 +5455,7 @@ class VersoPagesReadModal extends Modal {
     contentEl.createEl('h3', { text: 'Pages read' });
 
     const desc = contentEl.createEl('p', { cls: 'verso-confirm-body' });
-    desc.createSpan({ text: "Today's reading: " });
+    desc.createSpan({ text: this.extra ? 'Next reading: ' : "Today's reading: " });
     // Percent mode shows start → target (e.g. "20% → 23%"), so the reader
     // can see where today's reading begins as well as where it ends — the
     // lowest percent the input accepts is the start. (v1.3.2)
@@ -4487,12 +5589,12 @@ class VersoPagesReadModal extends Modal {
       if (p === null || Number.isNaN(p)) return 'Enter a percent.';
       if (p > 100) return 'Enter a percent from 0 to 100.';
       if (v === null || v < start) {
-        return `Today's reading starts at about ${this.pageToPercent(start)}%. Enter that or higher.`;
+        return `${this.readingName} starts at about ${this.pageToPercent(start)}%. Enter that or higher.`;
       }
       return null;
     }
     if (v === null || Number.isNaN(v)) return 'Enter a page number.';
-    if (v < start) return `Today's reading starts on page ${start}. Enter ${start} or higher.`;
+    if (v < start) return `${this.readingName} starts on page ${start}. Enter ${start} or higher.`;
     if (v > total) return `This book has ${total} pages.`;
     return null;
   }
@@ -4516,6 +5618,11 @@ class VersoPagesReadModal extends Modal {
   // behind/exact-match branches below — exactly one toast fires per
   // completion, never two stacked back to back.
   fireMessage(actualEnd) {
+    if (this.extra) {
+      const n = actualEnd - this.chunk.pagesStart + 1;
+      versoToast(`Logged ${n} page${n === 1 ? '' : 's'}. Your next readings get a little lighter.`);
+      return;
+    }
     const scheduled = this.scheduledEnd;
     const stillToday = this.plugin.getAllTodaysChunks();
     const allDoneToday = stillToday.length > 0 && stillToday.every(c => c.status === 'complete');
@@ -4723,6 +5830,40 @@ class VersoBookCompleteModal extends Modal {
       contentEl.createDiv({ text: countText, cls: 'verso-complete-shelf-count' });
     }
 
+    // ── Up next (v1.4.0): start a planned book from here ──────────
+    // Books with a saved due date come first, soonest first; the rest in
+    // the order they were added.
+    const planned = this.plugin.settings.books
+      .filter(b => b.status === 'planned')
+      .sort((a, b) => {
+        if (a.targetFinishDate && b.targetFinishDate) return a.targetFinishDate.localeCompare(b.targetFinishDate);
+        if (a.targetFinishDate) return -1;
+        if (b.targetFinishDate) return 1;
+        return (a.dateAdded || '').localeCompare(b.dateAdded || '');
+      });
+
+    if (planned.length > 0) {
+      contentEl.createDiv({ text: 'Up next', cls: 'verso-complete-shelf-label verso-up-next-label' });
+      const list = contentEl.createDiv({ cls: 'verso-up-next-list' });
+      planned.forEach(b => {
+        const row = list.createDiv({ cls: 'verso-up-next-row' });
+        const swatch = row.createDiv({ cls: 'verso-up-next-cover' });
+        swatch.style.backgroundColor = b.coverColor || '#B5D4F4';
+        const info = row.createDiv({ cls: 'verso-up-next-info' });
+        info.createDiv({ text: b.title, cls: 'verso-up-next-title' });
+        const meta = [];
+        if (b.author) meta.push(b.author);
+        meta.push(`${b.totalPages} pages`);
+        if (b.targetFinishDate) meta.push(`due ${versoFormatDate(b.targetFinishDate)}`);
+        info.createDiv({ text: meta.join(' · '), cls: 'verso-up-next-meta' });
+        const startBtn = row.createEl('button', { text: 'Start', cls: 'verso-btn verso-btn-secondary' });
+        startBtn.addEventListener('click', () => {
+          this.close();
+          new VersoActivateModal(this.app, this.plugin, b, () => this.plugin.refreshAllViews()).open();
+        });
+      });
+    }
+
     // ── Footer ────────────────────────────────────────────────
     const footer = contentEl.createDiv({ cls: 'verso-modal-footer' });
     const leftGroup = footer.createDiv({ cls: 'verso-footer-left' });
@@ -4865,6 +6006,22 @@ class AddBookModal extends Modal {
 
     const form = body.createDiv({ cls: 'verso-form' });
 
+    // ── Fill in from a note (v1.4.0) ──────────────────────────
+    const importField = form.createDiv({ cls: 'verso-field verso-import-field' });
+    const importBtn = importField.createEl('button', {
+      text: 'Fill in from a note…',
+      cls: 'verso-btn verso-btn-secondary verso-import-btn'
+    });
+    importBtn.addEventListener('click', () => {
+      new VersoNotePickerModal(this.app, file => this.importFromNote(file)).open();
+    });
+    if (this.importStatus) {
+      importField.createDiv({ cls: 'verso-field-desc', text: this.importStatus.filled });
+      this.importStatus.warnings.forEach(w =>
+        importField.createDiv({ cls: 'verso-field-warning', text: w })
+      );
+    }
+
     // ── Title (required) ──────────────────────────────────────
     const titleField = form.createDiv({ cls: 'verso-field' });
     titleField.createEl('label', { text: 'Title', cls: 'verso-field-label' });
@@ -4962,6 +6119,32 @@ class AddBookModal extends Modal {
     });
   }
 
+
+  // Copies title, author and pages from the chosen note's frontmatter into
+  // the form. Fields the note doesn't have are left as they were. A missing
+  // author only warns; title and pages fall to the usual required checks.
+  importFromNote(file) {
+    const cache = this.app.metadataCache.getFileCache(file);
+    const s = this.plugin.settings;
+    const found = versoBookFromFrontmatter(cache && cache.frontmatter, s);
+
+    const filled = [];
+    const warnings = [];
+    if (found.title) { this.formData.title = versoTitleCase(found.title); filled.push('title'); }
+    else warnings.push(`No title found (property "${s.importTitleProperty || 'title'}").`);
+    if (found.author) { this.formData.author = versoNameCase(found.author); filled.push('author'); }
+    else warnings.push(`No author found (property "${s.importAuthorProperty || 'author'}").`);
+    if (found.totalPages) { this.formData.totalPages = found.totalPages; filled.push('pages'); }
+    else warnings.push(`No page count found (property "${s.importPagesProperty || 'pages'}").`);
+
+    this.importStatus = {
+      filled: filled.length
+        ? `Filled in ${filled.join(', ')} from "${file.basename}".`
+        : `Nothing filled in from "${file.basename}".`,
+      warnings
+    };
+    this.render();
+  }
 
   renderScheduleStep(body) {
     body.createDiv({ cls: 'verso-section-label', text: 'SCHEDULE DETAILS' });
@@ -5223,6 +6406,24 @@ class AddBookModal extends Modal {
       );
     }
 
+    // ── Days off reminder (v1.4.0) ───────────────────────────────
+    const daysOff = versoDaysOffWarning(this.plugin.settings.daysOff,
+      versoWeeklyDays(preview.readingDays), this.formData.startDate, this.formData.targetFinishDate);
+    if (daysOff) {
+      const box = body.createDiv({ cls: 'verso-pace-note verso-pace-note-warning verso-days-off-warning' });
+      box.createDiv({ text: daysOff.text });
+      if (daysOff.laterFinish !== this.formData.targetFinishDate) {
+        const moveBtn = box.createEl('button', {
+          text: `Finish ${this.formatDateLong(daysOff.laterFinish)} instead`,
+          cls: 'verso-btn verso-btn-secondary verso-days-off-warning-btn'
+        });
+        moveBtn.addEventListener('click', () => {
+          this.formData.targetFinishDate = daysOff.laterFinish;
+          this.render();
+        });
+      }
+    }
+
     // ── Pace note ────────────────────────────────────────────────
     if (preview.readingDayCount === 0) {
       const noteBox = body.createDiv({ cls: 'verso-pace-note verso-pace-note-warning' });
@@ -5273,11 +6474,11 @@ class AddBookModal extends Modal {
       progressInputMode: this.formData.progressInputMode
     };
 
-    const readingDays = this.formData.overrideReadingDays
+    const readingDays = versoWithDaysOff(this.formData.overrideReadingDays
       ? this.formData.customReadingDays
       : this.plugin.settings.readingDays === 'custom'
         ? this.plugin.settings.customReadingDays
-        : this.plugin.settings.readingDays;
+        : this.plugin.settings.readingDays, this.plugin.settings.daysOff);
 
     const chunks = generateSchedule(tempBook, readingDays);
     const readingDayCount = countReadingDays(
@@ -5676,6 +6877,30 @@ class VersoSettingTab extends PluginSettingTab {
           );
       });
     }
+
+    // ─── Import from a note ────────────────────────────────────
+    containerEl.createEl('h3', { text: 'Import from a note' });
+    containerEl.createEl('p', {
+      text: 'In Add book, "Fill in from a note" copies these properties from a note\'s frontmatter. Capitals don\'t matter.',
+      cls: 'verso-settings-desc'
+    });
+
+    [
+      { key: 'importTitleProperty', name: 'Title property', fallback: 'title' },
+      { key: 'importAuthorProperty', name: 'Author property', fallback: 'author' },
+      { key: 'importPagesProperty', name: 'Pages property', fallback: 'pages' }
+    ].forEach(({ key, name, fallback }) => {
+      new Setting(containerEl)
+        .setName(name)
+        .addText(text => text
+          .setPlaceholder(fallback)
+          .setValue(this.plugin.settings[key] || '')
+          .onChange(async (value) => {
+            this.plugin.settings[key] = value.trim() || fallback;
+            await this.plugin.saveSettings();
+          })
+        );
+    });
 
     // ─── About ─────────────────────────────────────────────────
     containerEl.createEl('h3', { text: 'About' });
