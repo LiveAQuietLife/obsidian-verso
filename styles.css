@@ -1395,6 +1395,14 @@
   cursor: pointer;
 }
 
+/* Keyboard focus ring for "Log reading" and "Log more pages", matching
+   the reading checkboxes. (v1.4.1) */
+.verso-log-reading-link:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-s);
+}
+
 /* Days off reminder in Add book and Start reading (v1.4.0) */
 .verso-days-off-warning-btn {
   margin-top: 8px;

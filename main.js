@@ -1,8 +1,8 @@
 /*
  * Verso — Your reading life, scheduled.
- * v1.3.3 — Sync merge: two devices' copies of data.json are merged record
- * by record instead of one overwriting the other. Title case keeps capitals
- * the reader typed and lowercases "'s".
+ * v1.4.1 — Log more pages: once today's reading is checked off, log
+ * another sitting. Today's sittings share one row and uncheck newest
+ * first. Missed pages count down as you read into a missed reading.
  */
 
 const { Plugin, PluginSettingTab, Setting, Notice, Modal, ItemView, FuzzySuggestModal, Platform } = require('obsidian');
@@ -2539,6 +2539,78 @@ async markChunkComplete(chunkId, actualEnd = null) {
     return this.markChunkComplete(chunk.id, actualEnd);
   }
 
+  // ── Log more pages after today's reading is done (v1.4.1) ───
+  //
+  // A reader who reads in several sittings checks off today's reading,
+  // then reads again later. Before 1.4.1 the only way to add those pages
+  // was to uncheck and recheck the reading. "Log more pages" records the
+  // extra sitting as its own reading, exactly as "Log reading" does on a
+  // day with nothing scheduled. (Evarinyah, Discord, 2026-10-22)
+  //
+  // Returns the reading to log when the book has something scheduled
+  // today and all of it is checked off; otherwise null. Off-pace books
+  // are left out, as they are for "Log reading".
+  moreReadingFor(bookId) {
+    const book = this.getBook(bookId);
+    if (!book) return null;
+    const todays = this.getAllTodaysChunks().filter(c => c.bookId === bookId);
+    if (todays.length === 0 || todays.some(c => c.status !== 'complete')) return null;
+    if (getBookStatus(book, this.settings.chunks, this.getReadingDaysFor(book)) === 'off-pace') return null;
+    const reading = this.extraReadingFor(bookId);
+    if (!reading) return null;
+
+    // Nothing was scheduled today (a day off, or not a reading day): the
+    // only readings are sittings logged with "Log reading", so there's no
+    // "today's reading" to call done. Say how much was logged instead.
+    if (todays.every(c => c.extra)) {
+      reading.nothingScheduled = true;
+      reading.todayRead = todays.reduce((n, c) => n + (c.pagesEnd - c.pagesStart + 1), 0);
+      return reading;
+    }
+
+    // Fell short of today's plan (e.g. read 8 of 10 pages): suggest
+    // finishing today's pages, not the whole next reading, which by now
+    // has absorbed the shortfall. Only scheduled readings count as the
+    // plan; an extra sitting's scheduledPagesEnd is just its pre-fill.
+    const planned = todays.filter(c => !c.extra).map(c => c.scheduledPagesEnd || c.pagesEnd);
+    const plannedEnd = planned.length > 0 ? Math.min(Math.max(...planned), book.totalPages) : 0;
+    if (plannedEnd >= reading.pagesStart) {
+      reading.pagesEnd = plannedEnd;
+      reading.label = buildChunkLabel(reading.pagesStart, plannedEnd, book);
+      reading.restOfToday = true;
+      // For "8 of 10 pages read today" on the dashboard and sidebar.
+      const plannedStart = Math.min(...todays.filter(c => !c.extra).map(c => c.pagesStart));
+      reading.todayPlanned = plannedEnd - plannedStart + 1;
+      reading.todayRead = todays.reduce((n, c) => n + (c.pagesEnd - c.pagesStart + 1), 0);
+    }
+    return reading;
+  }
+
+  // Opens Pages read for a reading from extraReadingFor() or
+  // moreReadingFor() and stores it on confirm. Shared by the dashboard
+  // and the Today sidebar. onLogged refreshes the caller's view.
+  openLogReading(book, reading, onLogged) {
+    new VersoPagesReadModal(this.app, this, reading, book, async (actualEnd) => {
+      const { bookJustCompleted } = await this.logExtraReading(reading, actualEnd);
+      if (onLogged) onLogged();
+      if (bookJustCompleted) {
+        new VersoBookCompleteModal(this.app, this, book.id).open();
+      }
+      return { bookJustCompleted };
+    }, { extra: true }).open();
+  }
+
+  // A completed reading of the same book that starts after this one ends.
+  // Unchecking a reading while a later one is still checked would leave
+  // the later reading's pages out of step with what's been read, so
+  // versoConfirmUnmark asks for the later one first. (v1.4.1)
+  laterCompletedReading(chunk) {
+    return this.settings.chunks.find(c =>
+      c.bookId === chunk.bookId && c.id !== chunk.id &&
+      c.status === 'complete' && c.pagesStart > chunk.pagesEnd
+    ) || null;
+  }
+
   // Reverse an accidental completion: restores the chunk to 'upcoming',
   // removes its session, and un-completes the book if this was its final
   // chunk.
@@ -2702,7 +2774,15 @@ async markChunkComplete(chunkId, actualEnd = null) {
 
     const today = versoToday();
     const missedChunks = chunks.filter(c => isChunkMissed(c, today) && isChunkFromCurrentAttempt(c, book));
-    const missedPages = missedChunks.reduce((sum, c) => sum + (c.pagesEnd - c.pagesStart + 1), 0);
+    // Only the pages of a missed reading not yet read count as missed. A
+    // missed reading clears once the reader passes its last page (see
+    // recalculateSchedule); until then it shrinks as they read into it,
+    // rather than counting its whole range. (v1.4.1)
+    const lastPageRead = completedChunks.length > 0
+      ? Math.max(...completedChunks.map(c => c.pagesEnd))
+      : 0;
+    const missedPages = missedChunks.reduce((sum, c) =>
+      sum + Math.max(0, c.pagesEnd - Math.max(c.pagesStart - 1, lastPageRead)), 0);
 
     // Earliest still-upcoming chunk's date, if any. Used by the dashboard to
     // distinguish "on track, with a chunk due today" from "on track, but
@@ -2964,7 +3044,10 @@ class VersoDashboardView extends ItemView {
           return 0;
         });
 
-      chunksForBook.forEach(chunk => {
+      // Today's checked-off sittings share one row (v1.4.1); its checkbox
+      // acts on the latest sitting (todayRow.chunk).
+      versoTodayRows(chunksForBook, () => book).forEach(todayRow => {
+        const chunk = todayRow.chunk;
         const row = card.createDiv({ cls: 'verso-dashboard-card-chunk-row' });
         if (chunk.status === 'complete') row.addClass('verso-today-row-complete');
 
@@ -2975,13 +3058,15 @@ class VersoDashboardView extends ItemView {
         }
 
         const info = row.createDiv({ cls: 'verso-today-info' });
-        info.createSpan({ text: `${book.title} — ${chunk.label}`, cls: 'verso-today-label' });
+        info.createSpan({ text: `${book.title} — ${todayRow.label}`, cls: 'verso-today-label' });
 
-        const pages = chunk.pagesEnd - chunk.pagesStart + 1;
+        const pages = todayRow.pages;
         const meta = row.createDiv({ cls: 'verso-today-meta' });
-        meta.createSpan({ text: `${pages} page${pages === 1 ? '' : 's'}`, cls: 'verso-today-pages' });
+        let metaText = `${pages} page${pages === 1 ? '' : 's'}`;
+        if (todayRow.sittings > 1) metaText += ` · ${todayRow.sittings} sittings`;
+        meta.createSpan({ text: metaText, cls: 'verso-today-pages' });
 
-        versoMakeCheckboxAccessible(checkbox, chunk.status === 'complete', `${book.title}, ${chunk.label}`);
+        versoMakeCheckboxAccessible(checkbox, chunk.status === 'complete', `${book.title}, ${todayRow.label}`);
 
         // Only the checkbox itself toggles completion — the rest of the row
         // (title, pages) falls through to the card's "open book" click.
@@ -2999,7 +3084,7 @@ class VersoDashboardView extends ItemView {
               return { bookJustCompleted };
             }).open();
           } else {
-            versoConfirmUnmark(this.app, this.plugin, chunk, () => this.refreshAfterChunkUpdate());
+            versoConfirmUnmark(this.app, this.plugin, chunk, () => this.refreshAfterChunkUpdate(), todayRow);
           }
         });
       });
@@ -3050,19 +3135,27 @@ class VersoDashboardView extends ItemView {
         if (reading) {
           noteEl.appendText(' · ');
           const logLink = noteEl.createEl('a', { text: 'Log reading', cls: 'verso-log-reading-link' });
+          versoMakeLinkAccessible(logLink);
           logLink.addEventListener('click', (e) => {
             e.preventDefault();
             e.stopPropagation();
-            new VersoPagesReadModal(this.app, this.plugin, reading, book, async (actualEnd) => {
-              const { bookJustCompleted } = await this.plugin.logExtraReading(reading, actualEnd);
-              this.refreshAfterChunkUpdate();
-              if (bookJustCompleted) {
-                new VersoBookCompleteModal(this.app, this.plugin, book.id).open();
-              }
-              return { bookJustCompleted };
-            }, { extra: true }).open();
+            this.plugin.openLogReading(book, reading, () => this.refreshAfterChunkUpdate());
           });
         }
+      }
+
+      // Read again later: today's reading is checked off, so offer to log
+      // another sitting. (v1.4.1)
+      const more = this.plugin.moreReadingFor(book.id);
+      if (more) {
+        const moreEl = info.createDiv({ text: `${versoTodayReadText(more)} · `, cls: 'verso-progress-no-reading' });
+        const moreLink = moreEl.createEl('a', { text: 'Log more pages', cls: 'verso-log-reading-link' });
+        versoMakeLinkAccessible(moreLink);
+        moreLink.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          this.plugin.openLogReading(book, more, () => this.refreshAfterChunkUpdate());
+        });
       }
 
       const badge = header.createDiv({ cls: `verso-badge ${this.badgeClassForStatus(progress.status)}` });
@@ -3295,7 +3388,10 @@ class VersoTodaySidebarView extends ItemView {
 
     const list = container.createDiv({ cls: 'verso-today-sidebar-list' });
 
-    sorted.forEach(chunk => {
+    // Each book's checked-off sittings share one row; its checkbox acts on
+    // the latest sitting (todayRow.chunk). (v1.4.1)
+    versoTodayRows(sorted, id => this.plugin.getBook(id)).forEach(todayRow => {
+      const chunk = todayRow.chunk;
       const book = this.plugin.getBook(chunk.bookId);
       if (!book) return;
 
@@ -3311,11 +3407,29 @@ class VersoTodaySidebarView extends ItemView {
 
       const info = row.createDiv({ cls: 'verso-today-sidebar-info' });
       info.createDiv({ text: book.title, cls: 'verso-today-sidebar-title' });
-      info.createDiv({ text: chunk.label, cls: 'verso-today-sidebar-label' });
+      const labelText = todayRow.sittings > 1 ? `${todayRow.label} · ${todayRow.sittings} sittings` : todayRow.label;
+      info.createDiv({ text: labelText, cls: 'verso-today-sidebar-label' });
 
       if (!interactive) return;
 
-      versoMakeCheckboxAccessible(checkbox, chunk.status === 'complete', `${book.title}, ${chunk.label}`);
+      // "Log more pages" goes under the book's checked-off row once all of
+      // its readings today are done. (v1.4.1)
+      const more = chunk.status === 'complete' ? this.plugin.moreReadingFor(book.id) : null;
+      if (more) {
+        const moreEl = info.createDiv({ cls: 'verso-today-sidebar-label' });
+        if (more.restOfToday) moreEl.appendText(`${versoTodayReadText(more)} · `);
+        const moreLink = moreEl.createEl('a', { text: 'Log more pages', cls: 'verso-log-reading-link' });
+        versoMakeLinkAccessible(moreLink);
+        moreLink.addEventListener('click', (e) => {
+          e.preventDefault();
+          this.plugin.openLogReading(book, more, () => {
+            this.render();
+            this.plugin.refreshOpenDashboard();
+          });
+        });
+      }
+
+      versoMakeCheckboxAccessible(checkbox, chunk.status === 'complete', `${book.title}, ${todayRow.label}`);
       checkbox.addEventListener('click', async () => {
         if (chunk.status !== 'complete') {
           new VersoPagesReadModal(this.app, this.plugin, chunk, book, async (actualEnd) => {
@@ -3331,13 +3445,61 @@ class VersoTodaySidebarView extends ItemView {
           versoConfirmUnmark(this.app, this.plugin, chunk, () => {
             this.render();
             this.plugin.refreshOpenDashboard();
-          });
+          }, todayRow);
         }
       });
     });
   }
 }
 
+
+// Rows for a list of today's readings: each book's checked-off readings
+// collapse into one row ("pp. 189–218 · 3 sittings"), so a reader who
+// reads in many sittings doesn't get a long list. Unread readings keep a
+// row each. row.chunk is the reading the checkbox acts on; for a combined
+// row it's the latest sitting, so unchecking removes sittings one at a
+// time, newest first (see laterCompletedReading). Order is kept. (v1.4.1)
+function versoTodayRows(chunks, bookFor) {
+  const rows = [];
+  const doneByBook = new Map();
+  chunks.forEach(c => {
+    if (c.status !== 'complete') {
+      rows.push({ chunk: c, chunks: [c] });
+      return;
+    }
+    let row = doneByBook.get(c.bookId);
+    if (!row) {
+      row = { chunk: c, chunks: [] };
+      doneByBook.set(c.bookId, row);
+      rows.push(row);
+    }
+    row.chunks.push(c);
+    if (c.pagesStart > row.chunk.pagesStart) row.chunk = c;
+  });
+  rows.forEach(row => {
+    row.sittings = row.chunks.length;
+    row.pagesStart = Math.min(...row.chunks.map(c => c.pagesStart));
+    row.pagesEnd = Math.max(...row.chunks.map(c => c.pagesEnd));
+    row.pages = row.chunks.reduce((n, c) => n + (c.pagesEnd - c.pagesStart + 1), 0);
+    row.label = row.sittings > 1
+      ? buildChunkLabel(row.pagesStart, row.pagesEnd, bookFor(row.chunk.bookId))
+      : row.chunk.label;
+  });
+  return rows;
+}
+
+// The note before "Log more pages": "8 of 10 pages read today" when the
+// reader fell short of today's reading, "12 pages logged today" on a day
+// with nothing scheduled, otherwise "Today's reading done". (v1.4.1)
+function versoTodayReadText(reading) {
+  if (reading.nothingScheduled) {
+    const r = reading.todayRead;
+    return `${r} page${r === 1 ? '' : 's'} logged today`;
+  }
+  if (!reading.restOfToday) return "Today's reading done";
+  const n = reading.todayPlanned;
+  return `${reading.todayRead} of ${n} page${n === 1 ? '' : 's'} read today`;
+}
 
 // The round reading checkboxes are divs, so they need a role, a label, a
 // tab stop, and Enter/Space handling to work from the keyboard. (v1.3.2)
@@ -3354,26 +3516,76 @@ function versoMakeCheckboxAccessible(el, checked, label) {
   });
 }
 
+// "Log reading" and "Log more pages" are <a> elements with no href, which
+// Tab skips. Give them a button role, a tab stop, and Enter/Space handling,
+// the same as the reading checkboxes. (v1.4.1)
+function versoMakeLinkAccessible(el) {
+  el.setAttribute('role', 'button');
+  el.tabIndex = 0;
+  el.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      e.stopPropagation();
+      el.click();
+    }
+  });
+}
+
 // Unchecking a reading removes its logged pages, and on a finished book
 // reopens it, so it asks first. Shared by the dashboard and the sidebar.
 // (v1.3.2)
-function versoConfirmUnmark(app, plugin, chunk, onDone) {
+//
+// todayRow (optional, v1.4.1): the row from versoTodayRows. For a row that
+// combines several sittings, the dialog says only the latest sitting is
+// removed and the others stay checked off.
+function versoConfirmUnmark(app, plugin, chunk, onDone, todayRow = null) {
+  // A later reading of this book is still checked off: uncheck that one
+  // first, so the pages stay in order. (v1.4.1)
+  const later = plugin.laterCompletedReading(chunk);
+  if (later) {
+    versoToast(`Mark "${later.label}" as not done first. It comes after "${chunk.label}".`, 6000);
+    return;
+  }
   const book = plugin.getBook(chunk.bookId);
-  let body = `"${chunk.label}" will go back to unread, and its pages will no longer count as read.`;
+  const pages = chunk.pagesEnd - chunk.pagesStart + 1;
+  const pagesText = `${pages} page${pages === 1 ? '' : 's'}`;
+  const others = todayRow ? todayRow.chunks.filter(c => c.id !== chunk.id) : [];
+
+  let title, body, button, toast;
+  if (others.length > 0) {
+    // Combined row: removing the latest of several sittings. (v1.4.1)
+    const start = Math.min(...others.map(c => c.pagesStart));
+    const end = Math.max(...others.map(c => c.pagesEnd));
+    const otherWord = others.length === 1 ? 'sitting' : 'sittings';
+    title = 'Remove your latest sitting?';
+    body = `This removes only your latest sitting today, ${chunk.label} (${pagesText}). ` +
+      `Those pages will no longer count as read and go back into your schedule. ` +
+      `Your other ${others.length === 1 ? '' : others.length + ' '}${otherWord} today, ` +
+      `${buildChunkLabel(start, end, book)}, stay checked off. ` +
+      `To remove another, uncheck the row again.`;
+    button = 'Remove sitting';
+    toast = `Removed your sitting, ${chunk.label}.`;
+  } else if (chunk.extra) {
+    // A logged sitting on its own. (v1.4.1)
+    title = 'Remove this sitting?';
+    body = `Your sitting, ${chunk.label} (${pagesText}), will be removed. ` +
+      `Those pages will no longer count as read and go back into your schedule.`;
+    button = 'Remove sitting';
+    toast = `Removed your sitting, ${chunk.label}.`;
+  } else {
+    title = 'Mark as not done?';
+    body = `"${chunk.label}" will go back to unread, and its pages will no longer count as read.`;
+    button = 'Mark as not done';
+    toast = `"${chunk.label}" marked as not done.`;
+  }
   if (book && book.status === 'complete') {
     body += ` "${book.title}" will no longer be marked finished.`;
   }
-  new VersoConfirmModal(
-    app,
-    'Mark as not done?',
-    body,
-    'Mark as not done',
-    async () => {
-      await plugin.unmarkChunkComplete(chunk.id);
-      versoToast(`"${chunk.label}" marked as not done.`);
-      if (onDone) onDone();
-    }
-  ).open();
+  new VersoConfirmModal(app, title, body, button, async () => {
+    await plugin.unmarkChunkComplete(chunk.id);
+    versoToast(toast);
+    if (onDone) onDone();
+  }).open();
 }
 
 
@@ -5428,7 +5640,11 @@ class VersoPagesReadModal extends Modal {
     this.book = book;
     this.onConfirm = onConfirm || null;
     this.extra = !!options.extra;
-    this.readingName = this.extra ? 'Your next reading' : "Today's reading";
+    // chunk.restOfToday: finishing today's reading after falling short of
+    // it (see moreReadingFor). (v1.4.1)
+    this.restOfToday = this.extra && !!chunk.restOfToday;
+    this.readingName = this.restOfToday ? "The rest of today's reading"
+      : this.extra ? 'Your next reading' : "Today's reading";
 
     this.scheduledEnd = chunk.pagesEnd;
     this.actualEnd = chunk.pagesEnd; // pre-fill with the plan — stays the
@@ -5455,7 +5671,7 @@ class VersoPagesReadModal extends Modal {
     contentEl.createEl('h3', { text: 'Pages read' });
 
     const desc = contentEl.createEl('p', { cls: 'verso-confirm-body' });
-    desc.createSpan({ text: this.extra ? 'Next reading: ' : "Today's reading: " });
+    desc.createSpan({ text: this.restOfToday ? "Rest of today's reading: " : this.extra ? 'Next reading: ' : "Today's reading: " });
     // Percent mode shows start → target (e.g. "20% → 23%"), so the reader
     // can see where today's reading begins as well as where it ends — the
     // lowest percent the input accepts is the start. (v1.3.2)
@@ -5618,6 +5834,10 @@ class VersoPagesReadModal extends Modal {
   // behind/exact-match branches below — exactly one toast fires per
   // completion, never two stacked back to back.
   fireMessage(actualEnd) {
+    if (this.restOfToday && actualEnd === this.scheduledEnd) {
+      versoToast('All done for today. Nice.');
+      return;
+    }
     if (this.extra) {
       const n = actualEnd - this.chunk.pagesStart + 1;
       versoToast(`Logged ${n} page${n === 1 ? '' : 's'}. Your next readings get a little lighter.`);
