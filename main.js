@@ -1,8 +1,8 @@
 /*
  * Verso — Your reading life, scheduled.
- * v1.4.1 — Log more pages: once today's reading is checked off, log
- * another sitting. Today's sittings share one row and uncheck newest
- * first. Missed pages count down as you read into a missed reading.
+ * v1.4.2 — Next reading: once today's reading is done, the dashboard
+ * card, the book view and the "Pages read" message say what the next
+ * reading is and how many pages it has.
  */
 
 const { Plugin, PluginSettingTab, Setting, Notice, Modal, ItemView, FuzzySuggestModal, Platform } = require('obsidian');
@@ -2586,6 +2586,20 @@ async markChunkComplete(chunkId, actualEnd = null) {
     return reading;
   }
 
+  // The book's next reading still to read: the earliest upcoming reading
+  // dated today or later. Null for a book that isn't active or has no
+  // schedule left (off-pace, or every page read). (v1.4.2)
+  nextReadingFor(bookId) {
+    const book = this.getBook(bookId);
+    if (!book || book.status !== 'active') return null;
+    const today = versoToday();
+    return this.settings.chunks
+      .filter(c => c.bookId === bookId && c.status === 'upcoming' && c.scheduledDate >= today)
+      .sort((a, b) => a.scheduledDate < b.scheduledDate ? -1
+        : a.scheduledDate > b.scheduledDate ? 1
+        : a.pagesStart - b.pagesStart)[0] || null;
+  }
+
   // Opens Pages read for a reading from extraReadingFor() or
   // moreReadingFor() and stores it on confirm. Shared by the dashboard
   // and the Today sidebar. onLogged refreshes the caller's view.
@@ -2795,6 +2809,18 @@ async markChunkComplete(chunkId, actualEnd = null) {
       ? upcomingChunks.reduce((earliest, c) => c.scheduledDate < earliest ? c.scheduledDate : earliest, upcomingChunks[0].scheduledDate)
       : null;
 
+    // Pages a day to catch up, from the schedule itself: the pages left
+    // over the readings left. Counting reading days from today instead
+    // counted today after today's reading was done, and ignored days off,
+    // so it disagreed with "Next reading" (42 vs 44 pages). Rounded down,
+    // as distributePages does: each reading gets that many and the last
+    // one takes the leftover pages. Falls back to the day count if no
+    // readings are left. (v1.4.2)
+    const readingsLeft = upcomingChunks.filter(c => c.scheduledDate >= today).length;
+    const paceNeeded = readingsLeft > 0
+      ? Math.max(1, Math.floor((book.totalPages - pagesRead) / readingsLeft))
+      : calculatePaceNeeded(book.totalPages, pagesRead, book.targetFinishDate, readingDays);
+
     return {
       bookId,
       totalPages: book.totalPages,
@@ -2806,12 +2832,7 @@ async markChunkComplete(chunkId, actualEnd = null) {
       missedPages,
       status: getBookStatus(book, this.settings.chunks, readingDays),
       nextDueDate,
-      paceNeeded: calculatePaceNeeded(
-        book.totalPages,
-        pagesRead,
-        book.targetFinishDate,
-        readingDays
-      )
+      paceNeeded
     };
   }
 
@@ -3156,6 +3177,13 @@ class VersoDashboardView extends ItemView {
           e.stopPropagation();
           this.plugin.openLogReading(book, more, () => this.refreshAfterChunkUpdate());
         });
+
+        // Once today's reading is done, say what's next, so the reader
+        // knows how many pages to read. (v1.4.2)
+        const next = this.plugin.nextReadingFor(book.id);
+        if (next) {
+          info.createDiv({ text: versoNextReadingText(next, book), cls: 'verso-progress-no-reading' });
+        }
       }
 
       const badge = header.createDiv({ cls: `verso-badge ${this.badgeClassForStatus(progress.status)}` });
@@ -3501,6 +3529,38 @@ function versoTodayReadText(reading) {
   return `${reading.todayRead} of ${n} page${n === 1 ? '' : 's'} read today`;
 }
 
+// What a reading asks for: "pp. 25-36 (12 pages)", or "to 23%" for a book
+// tracked by percent, where a page count means little. (v1.4.2)
+function versoReadingAmountText(chunk, book) {
+  if (book && book.progressInputMode === 'percent') return `to ${chunk.label}`;
+  const n = chunk.pagesEnd - chunk.pagesStart + 1;
+  return `${chunk.label} (${n} page${n === 1 ? '' : 's'})`;
+}
+
+// When a reading is due, in words: "today", "tomorrow", a weekday within
+// the coming week ("Tue"), otherwise a date ("Nov 3"). long adds the date
+// to the weekday ("Tue, Oct 27"), for the book view. (v1.4.2)
+function versoReadingDayText(dateString, long = false, now = new Date()) {
+  const today = versoLocalDateString(now);
+  const tomorrow = new Date(now);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  if (dateString === today) return 'today';
+  if (dateString === versoLocalDateString(tomorrow)) return 'tomorrow';
+  const date = versoParseLocalDate(dateString);
+  if (long) return date.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+  const weekAhead = new Date(now);
+  weekAhead.setDate(weekAhead.getDate() + 6);
+  if (dateString <= versoLocalDateString(weekAhead)) {
+    return date.toLocaleDateString(undefined, { weekday: 'short' });
+  }
+  return versoFormatDate(dateString);
+}
+
+// "Next reading: pp. 25-36 (12 pages), tomorrow". (v1.4.2)
+function versoNextReadingText(chunk, book, long = false) {
+  return `Next reading: ${versoReadingAmountText(chunk, book)}, ${versoReadingDayText(chunk.scheduledDate, long)}`;
+}
+
 // The round reading checkboxes are divs, so they need a role, a label, a
 // tab stop, and Enter/Space handling to work from the keyboard. (v1.3.2)
 function versoMakeCheckboxAccessible(el, checked, label) {
@@ -3748,6 +3808,13 @@ class VersoBookView extends ItemView {
     versoAddSummaryRow(table, 'Start date', versoFormatDate(book.startDate));
     versoAddSummaryRow(table, 'Finish by', versoFormatDate(book.targetFinishDate));
     versoAddSummaryRow(table, 'Reading days', this.describeReadingDays(book));
+    // The next reading and its size, so the schedule can be checked
+    // without the dashboard. (v1.4.2)
+    const next = this.plugin.nextReadingFor(book.id);
+    if (next) {
+      versoAddSummaryRow(table, 'Next reading',
+        `${versoReadingAmountText(next, book)}, ${versoReadingDayText(next.scheduledDate, true)}`);
+    }
     const daysOff = this.plugin.upcomingDaysOff(book.id);
     if (daysOff.length) {
       versoAddSummaryRow(table, 'Days off', daysOff.map(x => versoDescribeDaysOff(x.range)).join('; '));
@@ -5838,9 +5905,13 @@ class VersoPagesReadModal extends Modal {
       versoToast('All done for today. Nice.');
       return;
     }
+    // Reading more or less than planned changes the readings ahead, so
+    // the message says what the next one is now. (v1.4.2)
+    const next = this.plugin.nextReadingFor(this.book.id);
+    const nextText = next ? ` ${versoNextReadingText(next, this.book)}.` : '';
     if (this.extra) {
       const n = actualEnd - this.chunk.pagesStart + 1;
-      versoToast(`Logged ${n} page${n === 1 ? '' : 's'}. Your next readings get a little lighter.`);
+      versoToast(`Logged ${n} page${n === 1 ? '' : 's'}.${nextText || ' Your next readings get a little lighter.'}`, nextText ? 6000 : undefined);
       return;
     }
     const scheduled = this.scheduledEnd;
@@ -5849,10 +5920,10 @@ class VersoPagesReadModal extends Modal {
 
     if (actualEnd < scheduled) {
       const behind = scheduled - actualEnd;
-      versoToast(`No worries — we'll spread the remaining ${behind} page${behind === 1 ? '' : 's'} across your upcoming reading days.`);
+      versoToast(`No worries — we'll spread the remaining ${behind} page${behind === 1 ? '' : 's'} across your upcoming reading days.${nextText}`, nextText ? 6000 : undefined);
     } else if (actualEnd > scheduled) {
       const ahead = actualEnd - scheduled;
-      versoToast(`You read ${ahead} page${ahead === 1 ? '' : 's'} ahead. Nice!`);
+      versoToast(`You read ${ahead} page${ahead === 1 ? '' : 's'} ahead. Nice!${nextText}`, nextText ? 6000 : undefined);
     } else if (allDoneToday) {
       versoToast('All done for today. Nice.');
     } else {
