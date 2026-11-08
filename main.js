@@ -737,10 +737,13 @@ function distributePages(firstPage, totalPages, dates) {
   let pageCursor = firstPage;
 
   dates.forEach((date, index) => {
-    // Give the remainder to the final day so earlier days are predictable
-    const isLastDay = index === dates.length - 1;
+    // Spread the leftover pages one each over the last few days. Giving
+    // them all to the final day could make it far heavier than the rest:
+    // 298 pages over 30 days was 9 a day, then 37 on the last day. Now no
+    // day is more than one page heavier than another (9, then 10 for the
+    // last 28 days). The early days stay the steady, lower amount. (v1.4.3)
     let daysPages = pagesPerDay;
-    if (isLastDay) daysPages += remainder;
+    if (index >= dates.length - remainder) daysPages += 1;
 
     // Don't generate empty chunks (can happen if totalPages < dates.length)
     if (daysPages <= 0) return;
@@ -1003,78 +1006,98 @@ function versoMergeData(local, other) {
 
   const complete = [];     // { chunk, side: 'local' | 'other' | 'both' }
   const completeIds = new Set();
+  const disputed = new Set();    // reading ids whose two versions differ
   allChunkIds.forEach(id => {
     const l = Lc.get(id);
     const o = Oc.get(id);
     const lOk = counts(l);
     const oOk = counts(o);
     if (!lOk && !oOk) return;
-    let chunk;
-    let side;
-    if (lOk && oOk) {
-      const same = JSON.stringify(l) === JSON.stringify(o);
-      if (same) { chunk = l; side = 'both'; }
-      else if ((l.dateCompleted || '') >= (o.dateCompleted || '')) { chunk = l; side = 'local'; }
-      else { chunk = o; side = 'other'; }
-    } else {
-      chunk = lOk ? l : o;
-      side = lOk ? 'local' : 'other';
-    }
+    const chunk = lOk ? l : o;
     if (bookGone(chunk.bookId)) return;
-    complete.push({ chunk, side });
     completeIds.add(id);
+    if (lOk && oOk) {
+      // The same reading, checked off differently on each copy (e.g. a
+      // different ending page): both versions compete below, like any
+      // other overlapping readings.
+      if (JSON.stringify(l) === JSON.stringify(o)) { complete.push({ chunk: l, side: 'both' }); return; }
+      disputed.add(id);
+      complete.push({ chunk: l, side: 'local' });
+      complete.push({ chunk: o, side: 'other' });
+      return;
+    }
+    complete.push({ chunk, side: lOk ? 'local' : 'other' });
   });
 
-  // Overlapping completed readings that came from different copies become
-  // one: the later one, widened to cover both ranges.
-  const droppedChunkIds = new Set();
-  const widened = new Map();   // chunkId -> widened copy
+  // Overlapping completed readings from different copies: the copy with the
+  // newest reading of that book wins those pages. (v1.4.3)
+  //
+  // Both copies start from the same shared readings, then each logs on its
+  // own until they sync. If their own readings overlap, they disagree about
+  // the same pages, and only one can be right. The copy used most recently
+  // holds the reader's latest "I stopped at page X", so its readings are
+  // kept and the other copy's readings from that point on are dropped.
+  //
+  // This replaced "widen the later reading to cover both" (v1.3.3). Widening
+  // tagged the widened reading with one copy only, so the other copy's
+  // smaller readings inside it were all kept too and counted twice (Nov 1:
+  // one PC reading p76-170 plus the phone's daily readings p76-156 gave 248
+  // pages read). It also assumed the union of both copies was right, but
+  // there the phone's newer reading showed the reader was at p156, not p170.
+  // The newest copy wins in all three real conflicts so far (Oct 15, Oct 17,
+  // Nov 1); widening only matched the first two.
+  //
+  // Readings that don't overlap the other copy's are always kept.
+  const dropped = new Set();     // entries (not ids: a reading's two versions share one)
+  const readingWinner = new Map(); // bookId -> side, for books whose copies disagreed
   const byBook = new Map();
   complete.forEach(entry => {
     if (!byBook.has(entry.chunk.bookId)) byBook.set(entry.chunk.bookId, []);
     byBook.get(entry.chunk.bookId).push(entry);
   });
-  byBook.forEach(entries => {
-    entries.sort((a, b) => (b.chunk.dateCompleted || '').localeCompare(a.chunk.dateCompleted || ''));
-    const kept = [];
-    entries.forEach(entry => {
-      const target = entry.side === 'both' ? null : kept.find(k =>
-        k.side !== 'both' && k.side !== entry.side && versoRangesOverlap(k.chunk, entry.chunk)
-      );
-      if (!target) { kept.push(entry); return; }
-      if (!widened.has(target.chunk.id)) {
-        target.chunk = { ...target.chunk };
-        widened.set(target.chunk.id, target.chunk);
-      }
-      target.chunk.pagesStart = Math.min(target.chunk.pagesStart, entry.chunk.pagesStart);
-      target.chunk.pagesEnd = Math.max(target.chunk.pagesEnd, entry.chunk.pagesEnd);
-      droppedChunkIds.add(entry.chunk.id);
+  byBook.forEach((entries, bookId) => {
+    const mine = entries.filter(e => e.side === 'local');
+    const theirs = entries.filter(e => e.side === 'other');
+    const clash = mine.some(a => theirs.some(b => versoRangesOverlap(a.chunk, b.chunk)));
+    if (!clash) return;
+    const newest = list => list.reduce((t, e) => ((e.chunk.dateCompleted || '') > t ? e.chunk.dateCompleted : t), '');
+    const nm = newest(mine);
+    const nt = newest(theirs);
+    const side = nm !== nt ? (nm > nt ? 'local' : 'other') : (preferLocal ? 'local' : 'other');
+    readingWinner.set(bookId, side);
+    const kept = side === 'local' ? mine : theirs;
+    const lost = side === 'local' ? theirs : mine;
+    // Drop the losing copy's readings that overlap the winner's, or that
+    // come after where the winner's own readings begin. Keeping a later
+    // one would leave a gap of unread pages before it.
+    const from = Math.min(...kept.map(e => e.chunk.pagesStart));
+    lost.forEach(e => {
+      if (e.chunk.pagesEnd >= from || kept.some(k => versoRangesOverlap(k.chunk, e.chunk))) dropped.add(e);
     });
-  });
-  widened.forEach(c => {
-    c.label = buildChunkLabel(c.pagesStart, c.pagesEnd, bookById.get(c.bookId));
   });
 
   const chunks = [];
   const finalComplete = new Map();
-  complete.forEach(({ chunk }) => {
-    if (droppedChunkIds.has(chunk.id)) return;
-    const c = widened.get(chunk.id) || chunk;
-    finalComplete.set(c.id, c);
-    chunks.push(c);
+  complete.forEach(entry => {
+    if (dropped.has(entry) || finalComplete.has(entry.chunk.id)) return;
+    finalComplete.set(entry.chunk.id, entry.chunk);
+    chunks.push(entry.chunk);
   });
 
   // Upcoming and missed readings come from whichever copy's book record won
-  // (they're rebuilt by recalculation anyway). Chunks of a book neither copy
-  // knows about are kept from either side.
+  // (they're rebuilt by recalculation anyway), or, if the copies' readings
+  // disagreed, from the copy whose readings won, so its missed readings
+  // match its history. Chunks of a book neither copy knows about are kept
+  // from either side.
   allChunkIds.forEach(id => {
-    if (completeIds.has(id)) return;
+    if (finalComplete.has(id)) return;
     const l = Lc.get(id);
     const o = Oc.get(id);
     const bookId = (l || o).bookId;
     if (bookGone(bookId)) return;
     let source;
-    if (bookById.has(bookId)) source = winner.get(bookId) === 'local' ? l : o;
+    if (readingWinner.has(bookId)) source = readingWinner.get(bookId) === 'local' ? l : o;
+    else if (bookById.has(bookId)) source = winner.get(bookId) === 'local' ? l : o;
     else source = l || o;
     if (!source || source.status === 'complete') return;
     chunks.push(source);
@@ -1089,7 +1112,6 @@ function versoMergeData(local, other) {
   const sessions = [];
   allSessions.forEach(s => {
     if (bookGone(s.bookId)) return;
-    if (droppedChunkIds.has(s.chunkId)) return;
     if (!chunkIdsKnown.has(s.chunkId)) { sessions.push(s); return; }  // older data
     if (!finalComplete.has(s.chunkId)) return;                         // unmarked
     if (!byChunk.has(s.chunkId)) byChunk.set(s.chunkId, []);
@@ -1104,12 +1126,11 @@ function versoMergeData(local, other) {
       const latest = group.reduce((a, b) => ((b.dateCompleted || '') > (a.dateCompleted || '') ? b : a));
       keep = [match || latest];
     }
+    // A reading whose two versions differed keeps one session, sized to
+    // the version that won.
     keep.forEach(s => {
-      if (widened.has(chunkId)) {
-        sessions.push({ ...s, pagesRead: chunk.pagesEnd - chunk.pagesStart + 1 });
-      } else {
-        sessions.push(s);
-      }
+      const size = chunk.pagesEnd - chunk.pagesStart + 1;
+      sessions.push(disputed.has(chunkId) && s.pagesRead !== size ? { ...s, pagesRead: size } : s);
     });
   });
 
@@ -2813,9 +2834,9 @@ async markChunkComplete(chunkId, actualEnd = null) {
     // over the readings left. Counting reading days from today instead
     // counted today after today's reading was done, and ignored days off,
     // so it disagreed with "Next reading" (42 vs 44 pages). Rounded down,
-    // as distributePages does: each reading gets that many and the last
-    // one takes the leftover pages. Falls back to the day count if no
-    // readings are left. (v1.4.2)
+    // as distributePages does: each reading gets at least that many, and
+    // the last few get one page more. Falls back to the day count if no
+    // readings are left. (v1.4.2; wording updated v1.4.3)
     const readingsLeft = upcomingChunks.filter(c => c.scheduledDate >= today).length;
     const paceNeeded = readingsLeft > 0
       ? Math.max(1, Math.floor((book.totalPages - pagesRead) / readingsLeft))
