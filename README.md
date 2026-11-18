@@ -19,7 +19,7 @@ If you fall behind, it doesn't spiral into shame math — it redistributes your 
 ### Dashboard
 Your active reading, at a glance. Books are sorted by urgency: off-pace first, then at-risk, then behind, then on-track by due date, then not yet started. Each book shows its status, today's reading chunk, and progress toward completion.
 
-![Dashboard](images/dashboard-new.jpg)
+![Dashboard](images/dashboard.png)
 
 
 ### Today sidebar
@@ -28,8 +28,8 @@ A compact reading reminder that lives in your sidebar. Shows just the books with
 ### Library
 Tabs for your Planned, Completed, and Archived books. Finished books get shelved — literally: their spines line up on a visual bookshelf, sorted by when you finished them. Archived books remember why they were set aside and can be restored whenever you're ready to pick them back up.
 
-![Library](images/library-new.jpg) 
-![Library](images/library-completed-new.jpg) 
+![Library](images/library.png) 
+![Library](images/library-completed.png) 
 
 ### Honest scheduling
 When you log what you actually read — more or less than the plan — Verso updates your schedule around reality, not the original numbers. Catch up or fall behind, the math always starts from where you actually are. Backdated start dates, missed days, and catch-up sessions all resolve cleanly.
@@ -39,7 +39,7 @@ If a book's target date passes entirely, Verso doesn't keep inventing a new plan
 ### Book completion celebration
 When you finish a book, Verso marks the moment with a quote about reading — a different one each time, drawn from a larger set for longer books. It also tells you honestly whether you moved your finish date along the way, and lines your finished book up on a shelf with everything else you've read this year. No inflated praise — just the truth, warmly delivered.
 
-![Finished Book](images/new-finished-book.png)
+![Finished Book](images/finished-book.png)
 
 ### Pages or percent
 Reading on a Kindle, Kobo, or another e-reader that only shows percentages? Track that book by percent instead of page numbers. Set it per book when you add or edit it — the scheduling math works exactly the same either way.
@@ -54,7 +54,12 @@ Set your default reading days globally (every day, weekdays only, or custom), th
 Going on a trip? Mark the dates, for all books or just one, and Verso schedules no reading on them. You choose whether finish dates stay put (a few more pages on the other days) or move later by the days lost, and Verso shows what each choice does before you save. If you find time to read on a day off anyway, click **Log reading** on the book's card and it counts.
 
 ### Fill in a book from a note
-Keep book notes in your vault? In Add book, choose **Fill in from a note…** and Verso copies the title, author and page count from the note's properties. You pick which property names it reads in Settings.
+Keep book notes in your vault? In Add book, choose **Fill in from a note…** and Verso copies the title, author, page count and location from the note's properties. You pick which property names it reads in Settings.
+
+### Where the book is
+Give each book a location, such as Kindle, Hoopla, Library Borrowed or Print, and Verso shows it next to today's reading, on the book page, in the Library and in Up next, so you know where to pick it up. Filter the Library by location to see what you have in each place. Manage the list in Settings: add your own, rename them, or delete the ones you never use.
+
+![Book locations in Settings](images/settings-locations.png)
 
 ### Pages left today
 On desktop, the status bar shows how many pages you have left today. Click it to open the dashboard.
@@ -95,7 +100,7 @@ It's built for independent readers and book clubs — people who read for their 
 4. Set your start date, target finish date, and reading days
 5. Verso builds your schedule — start reading
 
-![Add a Book](images/new-add-a-book.png)
+![Add a Book](images/add-a-book.png)
 
 ---
 

@@ -128,11 +128,18 @@ const DEFAULT_SETTINGS = {
   importTitleProperty: 'title',
   importAuthorProperty: 'author',
   importPagesProperty: 'pages',
+  importLocationProperty: 'location',
 
   // ── Days off (v1.4.0) ───────────────────────────────────────
   // Date ranges with no reading, for every book: [{ id, start, end, label }].
   // One book's own days off live on the book as book.daysOff.
-  daysOff: []
+  daysOff: [],
+
+  // ── Book locations (v1.5.0) ─────────────────────────────────
+  // Where books live (an app, a library loan, print), offered in Add book
+  // and Edit book. The reader can add, rename and delete entries in
+  // Settings; a book stores the name itself in book.location.
+  locations: ['Kindle', 'Logos', 'Hoopla', 'Libby', 'Library Borrowed', 'Audible', 'Print', 'PDF']
 };
 
 // ─── Data Helpers ────────────────────────────────────────────────────────────
@@ -203,8 +210,87 @@ function createBook(data = {}) {
     // only changes what the reader types in and what the daily target
     // label shows. (LiveAQuietLife, 2026-09-04)
     progressInputMode: data.progressInputMode || 'page',
+    // Where the book lives, e.g. "Kindle" or "Library Borrowed"; '' for
+    // none. One of settings.locations, kept in step when a location is
+    // renamed or deleted. (v1.5.0)
+    location: data.location || '',
     dateAdded: new Date().toISOString()
   };
+}
+
+// ─── Book locations (v1.5.0) ─────────────────────────────────────────────────
+
+// The list entry matching a name, ignoring case and surrounding spaces, or
+// undefined.
+function versoFindLocation(locations, name) {
+  const wanted = String(name || '').trim().toLowerCase();
+  if (!wanted) return undefined;
+  return (locations || []).find(l => l.trim().toLowerCase() === wanted);
+}
+
+// A small label showing where a book is, e.g. "Kindle". Nothing for a book
+// with no location.
+function versoAddLocationTag(parent, book) {
+  if (!book || !book.location) return null;
+  return parent.createSpan({ text: book.location, cls: 'verso-location-tag' });
+}
+
+// The Location dropdown used by Add book and Edit book. Offers "— None —",
+// the locations from Settings, the book's current location if it isn't in
+// the list (e.g. one deleted in Settings, or imported from a note), and
+// "Other…", which shows a text field for a new one. onChange gets the chosen
+// name ('' for none); a new name is added to the list when the book is saved
+// (see plugin.rememberLocation). onCommit, if given, is called when a choice
+// is final: a list entry or None picked, or an "Other…" name entered (on
+// Enter or leaving the field). Used where there's no Save button.
+function versoRenderLocationField(form, plugin, current, onChange, onCommit) {
+  const field = form.createDiv({ cls: 'verso-field' });
+  field.createEl('label', { text: 'Location', cls: 'verso-field-label' });
+  const select = field.createEl('select', { cls: 'verso-input verso-location-select' });
+
+  const names = [...(plugin.settings.locations || [])];
+  const listed = versoFindLocation(names, current);
+  if (current && !listed) names.push(current);
+
+  select.createEl('option', { text: '— None —', value: '__none__' });
+  names.forEach(name => select.createEl('option', { text: name, value: name }));
+  select.createEl('option', { text: 'Other…', value: '__other__' });
+  select.value = current ? (listed || current) : '__none__';
+
+  const otherField = form.createDiv({ cls: 'verso-field verso-field-indent' });
+  otherField.createEl('label', { text: 'New location', cls: 'verso-field-label' });
+  const otherInput = otherField.createEl('input', {
+    type: 'text',
+    cls: 'verso-input',
+    attr: { placeholder: 'e.g. Kobo' }
+  });
+  otherField.style.display = 'none';
+  otherInput.addEventListener('input', e => onChange(e.target.value.trim()));
+  if (onCommit) {
+    otherInput.addEventListener('change', e => {
+      const v = e.target.value.trim();
+      if (v) onCommit(v);
+    });
+  }
+
+  select.addEventListener('change', () => {
+    if (select.value === '__other__') {
+      otherField.style.display = 'flex';
+      onChange(otherInput.value.trim());
+      otherInput.focus();
+    } else {
+      otherField.style.display = 'none';
+      const v = select.value === '__none__' ? '' : select.value;
+      onChange(v);
+      if (onCommit) onCommit(v);
+    }
+  });
+
+  field.createDiv({
+    cls: 'verso-field-desc',
+    text: 'Where the book is, so Verso can remind you. Manage the list in Settings.'
+  });
+  return field;
 }
 
 function createChunk(data = {}) {
@@ -704,7 +790,13 @@ function versoBookFromFrontmatter(frontmatter, settings) {
   }
   if (!(totalPages > 0)) totalPages = null;
 
-  return { title, author, totalPages };
+  // Location (v1.5.0): one value; a list keeps its first entry. Matched to
+  // the Settings list ignoring case, so "kindle" becomes "Kindle".
+  const locationRaw = versoFrontmatterValue(frontmatter, settings.importLocationProperty || 'location');
+  const locationText = Array.isArray(locationRaw) ? text(locationRaw[0]) : text(locationRaw);
+  const location = versoFindLocation(settings.locations, locationText) || locationText;
+
+  return { title, author, totalPages, location };
 }
 
 class VersoNotePickerModal extends FuzzySuggestModal {
@@ -1416,7 +1508,8 @@ class VersoPlugin extends Plugin {
       this.externalCheckInProgress = false;
     }
 
-    // Catch up any missed reading days and redistribute schedules
+    // Catch up any missed reading days and redistribute schedules. In
+    // memory only: a new day alone doesn't rewrite data.json (v1.4.4).
     await this.recalculateAllBooks();
 
     this.setupStatusBar();
@@ -1693,6 +1786,11 @@ class VersoPlugin extends Plugin {
     this.settings.daysOff = Array.isArray(this.settings.daysOff)
       ? [...this.settings.daysOff]
       : [];
+    // An emptied list stays empty; only a missing one gets the defaults.
+    // (v1.5.0)
+    this.settings.locations = Array.isArray(this.settings.locations)
+      ? this.settings.locations.filter(l => typeof l === 'string' && l.trim())
+      : [...DEFAULT_SETTINGS.locations];
 
     this.settings.books.forEach(book => {
       if (!book.originalTargetFinishDate) {
@@ -1874,11 +1972,68 @@ class VersoPlugin extends Plugin {
   }
 
   // Replace the in-memory data with what's on disk, bring schedules up to
-  // today, and redraw every open view.
+  // today, and redraw every open view. Bringing them up to today doesn't
+  // write the file back (v1.4.4), so receiving another device's copy no
+  // longer sends a changed copy straight back to it.
   async reloadFromDisk() {
     await this.loadSettings();
     await this.rememberDataMtime();
     await this.recalculateAllBooks();
+    this.refreshAllViews();
+  }
+
+  // ── Book locations (v1.5.0) ─────────────────────────────────
+
+  // The name to store on a book for what the reader chose or typed: the
+  // list's own spelling if it's already listed (ignoring case), otherwise
+  // the trimmed name, which is added to the list. '' for none. Doesn't
+  // save; the book save that follows does.
+  rememberLocation(name) {
+    const trimmed = String(name || '').trim();
+    if (!trimmed) return '';
+    const listed = versoFindLocation(this.settings.locations, trimmed);
+    if (listed) return listed;
+    this.settings.locations.push(trimmed);
+    return trimmed;
+  }
+
+  booksAtLocation(name) {
+    return this.settings.books.filter(b => b.location && b.location === name);
+  }
+
+  // Add a location from Settings. Returns false if the name is empty or
+  // already listed.
+  async addLocation(name) {
+    const trimmed = String(name || '').trim();
+    if (!trimmed || versoFindLocation(this.settings.locations, trimmed)) return false;
+    this.settings.locations.push(trimmed);
+    await this.saveSettings();
+    return true;
+  }
+
+  // Rename a location in the list and on every book that uses it. Returns
+  // false if the new name is empty or belongs to another entry.
+  async renameLocation(oldName, newName) {
+    const trimmed = String(newName || '').trim();
+    if (!trimmed) return false;
+    const clash = versoFindLocation(this.settings.locations, trimmed);
+    if (clash && clash !== oldName) return false;
+    if (trimmed === oldName) return true;
+    this.settings.locations = this.settings.locations.map(l => (l === oldName ? trimmed : l));
+    this.settings.books = this.settings.books.map(b =>
+      (b.location === oldName ? { ...b, location: trimmed } : b));
+    await this.saveSettings();
+    this.refreshAllViews();
+    return true;
+  }
+
+  // Remove a location from the list. Books that used it lose it too, so no
+  // book shows a location that's no longer offered.
+  async deleteLocation(name) {
+    this.settings.locations = this.settings.locations.filter(l => l !== name);
+    this.settings.books = this.settings.books.map(b =>
+      (b.location === name ? { ...b, location: '' } : b));
+    await this.saveSettings();
     this.refreshAllViews();
   }
 
@@ -2326,11 +2481,20 @@ class VersoPlugin extends Plugin {
     return true;
   }
 
-  // Recalculate every active book — run on plugin load, at day rollover, and
-  // when the global reading days change. Saves ONCE at the end, and only if
-  // at least one book's schedule actually changed: on a normal restart
-  // nothing has changed since the last recalculation, so data.json is left
-  // untouched (which is what keeps sync tools from producing conflicts).
+  // Recalculate every active book, in memory only. Run on plugin load, at
+  // day rollover, after picking up another device's data.json, and after
+  // removing days off. Returns true if any book's schedule changed.
+  //
+  // It doesn't save (v1.4.4). On a new day the recalculation always changes
+  // something (yesterday's unread readings become missed, the rest is
+  // rebuilt), so saving here made every device rewrite data.json the first
+  // time it ran each day, even with nothing read. Two devices doing that
+  // before they synced was the main source of sync conflicts. The result is
+  // reproducible: recalculateSchedule depends only on the stored readings,
+  // the book, the reading days, and today's date, and its chunk ids are
+  // deterministic, so every device works out the same schedule from the
+  // same file. It's written along with the next real change, by whichever
+  // caller saves (removeDaysOff does so itself).
   async recalculateAllBooks() {
     const activeBooks = this.settings.books.filter(b =>
       b.status !== 'complete' && b.status !== 'archived' && b.status !== 'planned'
@@ -2339,7 +2503,6 @@ class VersoPlugin extends Plugin {
     for (const book of activeBooks) {
       if (this.recalculateBookInMemory(book.id)) anyChanged = true;
     }
-    if (anyChanged) await this.saveSettings();
     return anyChanged;
   }
 
@@ -2791,7 +2954,11 @@ async markChunkComplete(chunkId, actualEnd = null) {
     // would be summing inert historical chunks left over from before the
     // freeze. Reporting them here would resurrect exactly the fabricated
     // "X missed days" figure this whole fix exists to retire.
-    if (isOffPace(book, readingDays)) {
+    //
+    // A finished book is never off pace, even once its finish date has
+    // passed: its book page said "Off pace · Target was ..." for every
+    // finished book whose date was behind it. (v1.5.0)
+    if (book.status !== 'complete' && isOffPace(book, readingDays)) {
       return {
         bookId,
         totalPages: book.totalPages,
@@ -3101,6 +3268,7 @@ class VersoDashboardView extends ItemView {
 
         const info = row.createDiv({ cls: 'verso-today-info' });
         info.createSpan({ text: `${book.title} — ${todayRow.label}`, cls: 'verso-today-label' });
+        versoAddLocationTag(info, book);
 
         const pages = todayRow.pages;
         const meta = row.createDiv({ cls: 'verso-today-meta' });
@@ -3137,7 +3305,10 @@ class VersoDashboardView extends ItemView {
 
       const info = header.createDiv({ cls: 'verso-progress-info' });
       if (chunksForBook.length === 0) {
-        info.createDiv({ text: book.title, cls: 'verso-progress-title' });
+        const titleEl = info.createDiv({ text: book.title, cls: 'verso-progress-title' });
+        // With no reading today there's no row to carry the location, so
+        // it goes by the title. (v1.5.0)
+        versoAddLocationTag(titleEl, book);
       }
 
       if (book.author) {
@@ -3457,7 +3628,8 @@ class VersoTodaySidebarView extends ItemView {
       const info = row.createDiv({ cls: 'verso-today-sidebar-info' });
       info.createDiv({ text: book.title, cls: 'verso-today-sidebar-title' });
       const labelText = todayRow.sittings > 1 ? `${todayRow.label} · ${todayRow.sittings} sittings` : todayRow.label;
-      info.createDiv({ text: labelText, cls: 'verso-today-sidebar-label' });
+      const labelEl = info.createDiv({ text: labelText, cls: 'verso-today-sidebar-label' });
+      versoAddLocationTag(labelEl, book);
 
       if (!interactive) return;
 
@@ -3747,6 +3919,9 @@ class VersoBookView extends ItemView {
 
     this.renderBackLink(container);
     this.renderHeader(container, book, progress);
+    if (book.status === 'complete' || book.status === 'archived') {
+      this.renderLocationEditor(container, book);
+    }
     if (book.status === 'archived') {
       this.renderArchiveSummary(container, book);
     } else {
@@ -3772,6 +3947,19 @@ class VersoBookView extends ItemView {
     }
   }
 
+  // Finished and archived books have no Edit book, so their location is set
+  // here and saved as soon as it's chosen. Metadata only. (v1.5.0)
+  renderLocationEditor(container, book) {
+    const form = container.createDiv({ cls: 'verso-form verso-book-location-editor' });
+    versoRenderLocationField(form, this.plugin, book.location || '', () => {}, async (value) => {
+      const location = this.plugin.rememberLocation(value);
+      if (location === (book.location || '')) return;
+      await this.plugin.updateBook(book.id, { location });
+      this.render();
+      this.plugin.refreshAllViews();
+    });
+  }
+
   renderHeader(container, book, progress) {
     const header = container.createDiv({ cls: 'verso-book-header' });
 
@@ -3784,7 +3972,8 @@ class VersoBookView extends ItemView {
     const sub = [];
     if (book.author) sub.push(book.author);
     sub.push(`${book.totalPages} pages`);
-    info.createEl('div', { text: sub.join(' · '), cls: 'verso-book-subtitle' });
+    const subtitle = info.createEl('div', { text: sub.join(' · '), cls: 'verso-book-subtitle' });
+    versoAddLocationTag(subtitle, book);
 
     if (progress) {
       const statusRow = info.createDiv({ cls: 'verso-book-status-row' });
@@ -4012,6 +4201,7 @@ class VersoLibraryView extends ItemView {
     super(leaf);
     this.plugin = plugin;
     this.activeTab = 'planned';
+    this.locationFilter = '';
   }
 
   getViewType() {
@@ -4030,12 +4220,13 @@ class VersoLibraryView extends ItemView {
     if (state && state.activeTab && LIBRARY_TABS.some(t => t.key === state.activeTab)) {
       this.activeTab = state.activeTab;
     }
+    if (state && typeof state.locationFilter === 'string') this.locationFilter = state.locationFilter;
     this.render();
     return super.setState(state, result);
   }
 
   getState() {
-    return { activeTab: this.activeTab };
+    return { activeTab: this.activeTab, locationFilter: this.locationFilter || '' };
   }
 
   async onOpen() {
@@ -4054,6 +4245,8 @@ class VersoLibraryView extends ItemView {
     this.renderBackLink(container);
     this.renderHeaderRow(container);
 
+    // Before the tab bar, whose counts follow the filter. (v1.5.0)
+    this.syncLocationFilter();
     this.renderTabBar(container);
 
     this.tabBody = container.createDiv({ cls: 'verso-library-body' });
@@ -4102,6 +4295,7 @@ class VersoLibraryView extends ItemView {
         this.renderActiveTab();
       });
     });
+    this.renderLocationFilter(tabBar);
   }
 
   // Re-render just the tab bar (to update active styling) without rebuilding
@@ -4126,14 +4320,72 @@ class VersoLibraryView extends ItemView {
         this.renderActiveTab();
       });
     });
+    this.renderLocationFilter(tabBar);
   }
 
   countForTab(tabKey) {
-    const books = this.plugin.settings.books;
+    const books = this.filterByLocation(this.plugin.settings.books);
     if (tabKey === 'planned') return books.filter(b => b.status === 'planned').length;
     if (tabKey === 'completed') return books.filter(b => b.status === 'complete').length;
     if (tabKey === 'archived') return books.filter(b => b.status === 'archived').length;
     return 0;
+  }
+
+  // ── Location filter (v1.5.0) ───────────────────────────────────
+  // "What do I have in Hoopla?" '' shows every book; '__none__' shows books
+  // with no location. Applies to every tab and to the tab counts.
+
+  filterByLocation(books) {
+    const f = this.locationFilter || '';
+    if (!f) return books;
+    if (f === '__none__') return books.filter(b => !b.location);
+    return books.filter(b => b.location === f);
+  }
+
+  // Locations used by any Library book, in the Settings list's order, then
+  // any no longer listed.
+  libraryLocations() {
+    const used = new Set(this.plugin.settings.books
+      .filter(b => b.status !== 'active' && b.location)
+      .map(b => b.location));
+    const listed = (this.plugin.settings.locations || []).filter(l => used.has(l));
+    return [...listed, ...[...used].filter(l => !listed.includes(l))];
+  }
+
+  // Drops a filter left on a location no Library book uses anymore. Run
+  // before the tab bar, whose counts follow the filter.
+  syncLocationFilter() {
+    const names = this.libraryLocations();
+    if (names.length === 0 ||
+        (this.locationFilter && this.locationFilter !== '__none__' && !names.includes(this.locationFilter))) {
+      this.locationFilter = '';
+    }
+  }
+
+  // The filter sits at the end of the tab bar. Shown once a Library book
+  // has a location.
+  renderLocationFilter(tabBar) {
+    const names = this.libraryLocations();
+    if (names.length === 0) return;
+    const row = tabBar.createDiv({ cls: 'verso-library-filter' });
+    const select = row.createEl('select', { cls: 'verso-input verso-location-select', attr: { 'aria-label': 'Filter by location' } });
+    select.createEl('option', { text: 'All locations', value: '' });
+    names.forEach(n => select.createEl('option', { text: n, value: n }));
+    select.createEl('option', { text: 'No location', value: '__none__' });
+    select.value = this.locationFilter || '';
+    select.addEventListener('change', () => {
+      this.locationFilter = select.value;
+      this.render();
+    });
+  }
+
+  // Empty message for a tab that has books, just none at the chosen
+  // location. Returns true if it was shown.
+  renderFilteredEmpty(container) {
+    if (!this.locationFilter) return false;
+    const where = this.locationFilter === '__none__' ? 'with no location' : `in ${this.locationFilter}`;
+    container.createEl('p', { text: `No books ${where} here.`, cls: 'verso-step-placeholder' });
+    return true;
   }
 
   // Keep archived-row reasons short — full text is shown in Book View.
@@ -4160,9 +4412,10 @@ class VersoLibraryView extends ItemView {
   // ── Planned tab ────────────────────────────────────────────────
 
   renderPlannedTab(container) {
-    const books = this.plugin.settings.books.filter(b => b.status === 'planned');
+    const books = this.filterByLocation(this.plugin.settings.books.filter(b => b.status === 'planned'));
 
     if (books.length === 0) {
+      if (this.renderFilteredEmpty(container)) return;
       container.createEl('p', {
         text: 'No planned books. Add a book and choose "Add to my reading list" to queue it up here.',
         cls: 'verso-step-placeholder'
@@ -4191,7 +4444,7 @@ class VersoLibraryView extends ItemView {
       if (book.author) meta.push(book.author);
       meta.push(`${book.totalPages} pages`);
       if (book.targetFinishDate) meta.push(`aiming for ${versoFormatDate(book.targetFinishDate)}`);
-      info.createDiv({ text: meta.join(' · '), cls: 'verso-library-meta' });
+      versoAddLocationTag(info.createDiv({ text: meta.join(' · '), cls: 'verso-library-meta' }), book);
 
       const actions = row.createDiv({ cls: 'verso-library-actions' });
 
@@ -4226,9 +4479,10 @@ class VersoLibraryView extends ItemView {
   // ── Completed tab ──────────────────────────────────────────────
 
   renderCompletedTab(container) {
-    const books = this.plugin.settings.books.filter(b => b.status === 'complete');
+    const books = this.filterByLocation(this.plugin.settings.books.filter(b => b.status === 'complete'));
 
     if (books.length === 0) {
+      if (this.renderFilteredEmpty(container)) return;
       container.createEl('p', {
         text: 'No completed books yet.',
         cls: 'verso-step-placeholder'
@@ -4269,16 +4523,17 @@ class VersoLibraryView extends ItemView {
         const completedOn = new Date(book.dateCompleted).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
         meta.push(`finished ${completedOn}`);
       }
-      info.createDiv({ text: meta.join(' · '), cls: 'verso-library-meta' });
+      versoAddLocationTag(info.createDiv({ text: meta.join(' · '), cls: 'verso-library-meta' }), book);
     });
   }
 
   // ── Archived tab ─────────────────────────────────────────────────
 
   renderArchivedTab(container) {
-    const books = this.plugin.getArchivedBooks();
+    const books = this.filterByLocation(this.plugin.getArchivedBooks());
 
     if (books.length === 0) {
+      if (this.renderFilteredEmpty(container)) return;
       container.createEl('p', {
         text: 'No archived books.',
         cls: 'verso-step-placeholder'
@@ -4310,7 +4565,7 @@ class VersoLibraryView extends ItemView {
       if (book.archiveReason) {
         meta.push(this.truncateReason(book.archiveReason));
       }
-      info.createDiv({ text: meta.join(' · '), cls: 'verso-library-meta' });
+      versoAddLocationTag(info.createDiv({ text: meta.join(' · '), cls: 'verso-library-meta' }), book);
 
       const actions = row.createDiv({ cls: 'verso-library-actions' });
       const restoreBtn = actions.createEl('button', {
@@ -5100,6 +5355,8 @@ class VersoEditBookModal extends Modal {
     // chunks keep their stored page numbers regardless of mode.
     // (LiveAQuietLife, 2026-09-04)
     this.progressInputMode = book.progressInputMode || 'page';
+    // Where the book is ('' for none). (v1.5.0)
+    this.location = book.location || '';
 
     // A planned book has no start date yet — it's set when the book is
     // activated (VersoActivateModal). Schedule editing here is limited to
@@ -5209,6 +5466,12 @@ class VersoEditBookModal extends Modal {
     form.createEl('div', {
       cls: 'verso-field-desc',
       text: "For e-readers (Kindle, Kobo, etc.) that only show a percent, not a page number."
+    });
+
+    // ── Location (v1.5.0) ────────────────────────────────────────
+    // Metadata only, like the collection below: no schedule change.
+    versoRenderLocationField(form, this.plugin, this.location, value => {
+      this.location = value;
     });
 
     // ── Collection picker ────────────────────────────────────────
@@ -5489,6 +5752,9 @@ class VersoEditBookModal extends Modal {
     if (this.progressInputMode !== (this.book.progressInputMode || 'page')) {
       infoUpdates.progressInputMode = this.progressInputMode;
     }
+    // A location typed under "Other…" joins the Settings list. (v1.5.0)
+    const location = await this.plugin.rememberLocation(this.location);
+    if (location !== (this.book.location || '')) infoUpdates.location = location;
 
     const infoChanged = Object.keys(infoUpdates).length > 0;
     if (infoChanged) {
@@ -6167,7 +6433,8 @@ class VersoBookCompleteModal extends Modal {
         if (b.author) meta.push(b.author);
         meta.push(`${b.totalPages} pages`);
         if (b.targetFinishDate) meta.push(`due ${versoFormatDate(b.targetFinishDate)}`);
-        info.createDiv({ text: meta.join(' · '), cls: 'verso-up-next-meta' });
+        const metaEl = info.createDiv({ text: meta.join(' · '), cls: 'verso-up-next-meta' });
+        versoAddLocationTag(metaEl, b);
         const startBtn = row.createEl('button', { text: 'Start', cls: 'verso-btn verso-btn-secondary' });
         startBtn.addEventListener('click', () => {
           this.close();
@@ -6231,7 +6498,9 @@ class AddBookModal extends Modal {
       overrideReadingDays: false,
       customReadingDays: this.getGlobalReadingDaysAsObject(),
       // 'page' or 'percent' — see progressInputMode on the book itself.
-      progressInputMode: 'page'
+      progressInputMode: 'page',
+      // Where the book is ('' for none). (v1.5.0)
+      location: ''
     };
   }
 
@@ -6411,6 +6680,11 @@ class AddBookModal extends Modal {
       text: "For e-readers (Kindle, Kobo, etc.) that only show a percent, not a page number."
     });
 
+    // ── Location (v1.5.0) ────────────────────────────────────────
+    versoRenderLocationField(form, this.plugin, this.formData.location, value => {
+      this.formData.location = value;
+    });
+
     // ── Cover color ──────────────────────────────────────────────
     const colorField = form.createDiv({ cls: 'verso-field verso-field-color' });
     colorField.createEl('label', { text: 'Cover color', cls: 'verso-field-label' });
@@ -6448,6 +6722,8 @@ class AddBookModal extends Modal {
     else warnings.push(`No author found (property "${s.importAuthorProperty || 'author'}").`);
     if (found.totalPages) { this.formData.totalPages = found.totalPages; filled.push('pages'); }
     else warnings.push(`No page count found (property "${s.importPagesProperty || 'pages'}").`);
+    // Location is optional, so a note without one doesn't warn. (v1.5.0)
+    if (found.location) { this.formData.location = found.location; filled.push('location'); }
 
     this.importStatus = {
       filled: filled.length
@@ -6942,6 +7218,9 @@ class AddBookModal extends Modal {
       collectionId = collection.id;
     }
 
+    // A location typed under "Other…" joins the Settings list. (v1.5.0)
+    const location = await this.plugin.rememberLocation(this.formData.location);
+
     if (this.formData.addMode === 'later') {
       // Planned: no schedule yet. targetFinishDate is preserved if the
       // reader set a due date (e.g. a syllabus deadline); startDate stays
@@ -6954,7 +7233,8 @@ class AddBookModal extends Modal {
         collectionId: collectionId,
         targetFinishDate: this.formData.targetFinishDate || null,
         status: 'planned',
-        progressInputMode: this.formData.progressInputMode
+        progressInputMode: this.formData.progressInputMode,
+        location: location
       });
       return;
     }
@@ -6972,7 +7252,8 @@ class AddBookModal extends Modal {
       startDate: this.formData.startDate,
       targetFinishDate: this.formData.targetFinishDate,
       readingDaysOverride: readingDaysOverride,
-      progressInputMode: this.formData.progressInputMode
+      progressInputMode: this.formData.progressInputMode,
+      location: location
     });
   }
 
@@ -6990,7 +7271,8 @@ class AddBookModal extends Modal {
       targetFinishDate: '',
       overrideReadingDays: false,
       customReadingDays: this.getGlobalReadingDaysAsObject(),
-      progressInputMode: 'page'
+      progressInputMode: 'page',
+      location: ''
     };
   }
 
@@ -7190,6 +7472,9 @@ class VersoSettingTab extends PluginSettingTab {
       });
     }
 
+    // ─── Book locations (v1.5.0) ───────────────────────────────
+    this.renderLocationSettings(containerEl);
+
     // ─── Import from a note ────────────────────────────────────
     containerEl.createEl('h3', { text: 'Import from a note' });
     containerEl.createEl('p', {
@@ -7200,7 +7485,8 @@ class VersoSettingTab extends PluginSettingTab {
     [
       { key: 'importTitleProperty', name: 'Title property', fallback: 'title' },
       { key: 'importAuthorProperty', name: 'Author property', fallback: 'author' },
-      { key: 'importPagesProperty', name: 'Pages property', fallback: 'pages' }
+      { key: 'importPagesProperty', name: 'Pages property', fallback: 'pages' },
+      { key: 'importLocationProperty', name: 'Location property', fallback: 'location' }
     ].forEach(({ key, name, fallback }) => {
       new Setting(containerEl)
         .setName(name)
@@ -7231,6 +7517,67 @@ class VersoSettingTab extends PluginSettingTab {
   // turn all upcoming chunks — including future-dated ones — into permanent
   // 'missed' history. That's an in-between state of the toggles, not a real
   // choice, so wait until at least one day is selected again.
+  // Book locations: rename an entry by editing its name (applied when the
+  // field loses focus), delete it with the trash button, or add one at the
+  // end. Renaming or deleting updates the books that use it. (v1.5.0)
+  renderLocationSettings(containerEl) {
+    const plugin = this.plugin;
+    containerEl.createEl('h3', { text: 'Book locations' });
+    containerEl.createEl('p', {
+      text: 'Where your books are, offered in Add book and Edit book and shown next to your reading. Delete the ones you never use.',
+      cls: 'verso-settings-desc'
+    });
+
+    plugin.settings.locations.forEach(name => {
+      const count = plugin.booksAtLocation(name).length;
+      new Setting(containerEl)
+        .setName(name)
+        .setDesc(count === 0 ? 'No books' : `${count} book${count === 1 ? '' : 's'}`)
+        .addText(text => {
+          text.setValue(name);
+          text.inputEl.setAttribute('aria-label', `Rename ${name}`);
+          text.inputEl.addEventListener('change', async () => {
+            const ok = await plugin.renameLocation(name, text.getValue());
+            if (!ok) new Notice(`Couldn't rename "${name}": the new name is empty or already in the list.`);
+            this.display();
+          });
+        })
+        .addExtraButton(btn => btn
+          .setIcon('trash')
+          .setTooltip(`Delete ${name}`)
+          .onClick(() => {
+            if (count === 0) {
+              plugin.deleteLocation(name).then(() => this.display());
+              return;
+            }
+            new VersoConfirmModal(
+              this.app,
+              `Delete "${name}"?`,
+              `${count} book${count === 1 ? ' is' : 's are'} set to ${name}. ${count === 1 ? 'It' : 'They'} will have no location.`,
+              'Delete',
+              async () => {
+                await plugin.deleteLocation(name);
+                this.display();
+              },
+              'danger'
+            ).open();
+          }));
+    });
+
+    let newName = '';
+    new Setting(containerEl)
+      .setName('Add a location')
+      .addText(text => text
+        .setPlaceholder('e.g. Kobo')
+        .onChange(value => { newName = value; }))
+      .addButton(btn => btn
+        .setButtonText('Add')
+        .onClick(async () => {
+          if (await plugin.addLocation(newName)) this.display();
+          else new Notice('Type a location that isn\'t already in the list.');
+        }));
+  }
+
   async rescheduleForNewReadingDays() {
     const settings = this.plugin.settings;
     if (settings.readingDays === 'custom' &&
@@ -7238,8 +7585,13 @@ class VersoSettingTab extends PluginSettingTab {
       new Notice('Select at least one reading day — schedules will update once you do.');
       return;
     }
+    // recalculateAllBooks no longer saves (v1.4.4); changing reading days
+    // is the reader's own change, so the new schedule is saved here.
     const changed = await this.plugin.recalculateAllBooks();
-    if (changed) this.plugin.refreshAllViews();
+    if (changed) {
+      await this.plugin.saveSettings();
+      this.plugin.refreshAllViews();
+    }
   }
 }
 

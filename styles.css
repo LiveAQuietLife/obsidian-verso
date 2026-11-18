@@ -1434,3 +1434,38 @@
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-m);
 }
+
+/* ── Book locations (v1.5.0) ─────────────────────────────── */
+/* "Kindle", "Library Borrowed": where the book is, next to its reading. */
+.verso-location-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 0.75em;
+  font-weight: 500;
+  line-height: 1.6;
+  vertical-align: middle;
+  white-space: nowrap;
+  color: var(--text-muted);
+  background-color: var(--background-modifier-hover);
+  border: 1px solid var(--background-modifier-border);
+}
+
+/* At the end of the Library tab bar. */
+.verso-library-filter {
+  display: flex;
+  align-items: center;
+  margin-left: auto;
+}
+
+/* Location on a finished or archived book's page. */
+.verso-book-location-editor {
+  margin: 12px 0 4px;
+  max-width: 360px;
+}
+
+.verso-library-filter .verso-location-select {
+  width: auto;
+  max-width: 100%;
+}
