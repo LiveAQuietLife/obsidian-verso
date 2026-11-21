@@ -1,0 +1,81 @@
+name: "Something isn't working"
+description: "Verso shows something wrong, loses or changes data, or throws an error."
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: "Thanks for taking the time. Please leave out anything private: made-up names and titles that show the problem are just as good."
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What were you doing, what did Verso do, and what did you expect instead?
+      placeholder: "I logged 30 pages on my phone and my laptop still shows yesterday's total…"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of Verso?
+      multiple: true
+      options:
+        - "Dashboard"
+        - "Today sidebar"
+        - "Library"
+        - "Schedule or pace (behind, catching up)"
+        - "Pages or percent"
+        - "Reading days or days off"
+        - "Fill in a book from a note"
+        - "Book completion"
+        - "Vocabulary settings"
+        - "Sync between devices"
+        - "Something else"
+  - type: dropdown
+    id: data
+    attributes:
+      label: Was anything lost or changed that you didn't change?
+      options:
+        - "No"
+        - "Yes, something was lost or changed"
+        - "Not sure"
+    validations:
+      required: true
+  - type: dropdown
+    id: sync
+    attributes:
+      label: Do you use the vault on more than one device?
+      options:
+        - "No, one device"
+        - "Yes, with Obsidian Sync"
+        - "Yes, with iCloud, Dropbox, OneDrive or similar"
+        - "Yes, with Git or Syncthing"
+        - "Yes, another way"
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Verso version
+      description: Settings → Community plugins.
+    validations:
+      required: true
+  - type: input
+    id: obsidian-version
+    attributes:
+      label: Obsidian version
+      description: Settings → General.
+  - type: dropdown
+    id: os
+    attributes:
+      label: Device
+      multiple: true
+      options:
+        - "Windows"
+        - "macOS"
+        - "Linux"
+        - "iPhone or iPad"
+        - "Android"
+  - type: textarea
+    id: console
+    attributes:
+      label: Errors in the developer console (optional, desktop)
+      description: Ctrl+Shift+I (Cmd+Option+I on a Mac), then the Console tab. Copy any red lines that mention Verso.
+      render: text
